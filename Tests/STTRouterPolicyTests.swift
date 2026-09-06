@@ -11,6 +11,35 @@
 import Foundation
 
 func testSTTRouterPolicy() {
+    runSuite("Recording admission establishes the resolved variant before capturing audio") {
+        let sourceURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Sources/Speech/STTRouter.swift")
+        let source = try! String(contentsOf: sourceURL, encoding: .utf8)
+        let start = source.range(of: "private func setActiveRecordingModel")!
+        let end = source.range(of: "private func clearActiveRecordingModel", range: start.upperBound..<source.endIndex)!
+        let admission = String(source[start.lowerBound..<end.lowerBound])
+        let resolved = admission.range(of: "beginForegroundUse(of: model)")!
+        let prepared = admission.range(of: "prepareModelVariantForRecording(variant)")!
+        let retained = admission.range(of: "recordingModelOwnership.replace(with: resolvedModel)")!
+        assertTrue(resolved.lowerBound < prepared.lowerBound)
+        assertTrue(prepared.lowerBound < retained.lowerBound)
+        assertTrue(admission.contains("resolvedModel.parakeetVariant"), "selection must use the lease, not the picker")
+    }
+
+    runSuite("Parakeet v2 shares the backend but has a distinct artifact identity") {
+        let model = TranscriptionModelChoice.parakeetTDTv2
+        assertEqual(model.engineName, "parakeet")
+        assertFalse(model.isWhisper)
+        assertNil(model.whisperKitModelName)
+        assertEqual(model.rawValue, "parakeet-tdt-v2")
+        assertEqual(model.transcriptionEngineIdentifier, "parakeet_v2_local")
+        assertEqual(model.transcriptionEngineDisplayName, "Parakeet V2")
+        assertEqual(TranscriptionModelChoice.parakeetTDTv3.transcriptionEngineDisplayName, "Parakeet",
+                    "existing v3 transcript footer text must remain stable")
+        assertTrue(model.title.contains("English only"))
+        assertFalse(model.shortTitle == TranscriptionModelChoice.parakeetTDTv3.shortTitle)
+    }
+
     runSuite("STTRouter policy — Parakeet routes to the parakeet engine") {
         let model: TranscriptionModelChoice = .parakeetTDTv3
 

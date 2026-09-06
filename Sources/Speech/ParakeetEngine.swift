@@ -1,5 +1,5 @@
 // ParakeetEngine.swift
-// FluidAudio-based STT engine — CoreML Parakeet TDT V3 for batch transcription.
+// FluidAudio-based STT engine — CoreML Parakeet TDT V2/V3 for batch transcription.
 // AVAudioEngine tap → NSLock-batched samples → resampled to 16kHz → AsrManager.transcribe()
 // for final batch inference.
 
@@ -92,6 +92,10 @@ class ParakeetEngine: ObservableObject {
 
     // FluidAudio ASR
     var asrManager: AsrManager?
+    var modelVariant: ParakeetModelVariant = .v3
+    var loadedModelVariant: ParakeetModelVariant?
+    var modelCleanupTask: Task<Void, Never>?
+    let modelTeardownGate = ParakeetModelTeardownGate()
     var modelInitializationTask: Task<Void, Never>?
     var modelInitializationGeneration: UInt64 = 0
     var modelFilePrefetchTask: Task<URL, Error>?
@@ -127,6 +131,18 @@ class ParakeetEngine: ObservableObject {
     var systemInputReconciliationTask: Task<Void, Never>?
 
     var isModelLoaded: Bool { asrManagerReady }
+
+    func isModelLoaded(for variant: ParakeetModelVariant) -> Bool {
+        asrManagerReady && loadedModelVariant == variant
+    }
+
+    func modelDownloadState(for variant: ParakeetModelVariant) -> ParakeetModelState {
+        guard variant == modelVariant else {
+            return ModelCacheInventory.activeParakeetModelDirectory(variant: variant) != nil
+                || bundledParakeetModelPath(variant: variant) != nil ? .cached : .notLoaded
+        }
+        return modelDownloadState
+    }
     var inputDeviceName: String { cachedInputDeviceName }
     var isRecordingFromSharedMeetingMic: Bool { sharedMeetingMicClaim != nil }
     var hasReceivedAudioSamples: Bool { didReceiveAudioSamples }
@@ -149,17 +165,20 @@ class ParakeetEngine: ObservableObject {
     /// than a network download. Dictation uses this to open the microphone
     /// immediately and load the model concurrently.
     var modelFilesAvailableLocally: Bool {
-        if asrManagerReady { return true }
-        switch modelDownloadState {
+        modelFilesAvailableLocally(for: modelVariant)
+    }
+
+    func modelFilesAvailableLocally(for variant: ParakeetModelVariant) -> Bool {
+        if isModelLoaded(for: variant) { return true }
+        switch modelDownloadState(for: variant) {
         case .downloading, .failed:
             return false
         case .notLoaded, .cached, .loading, .ready:
-            return prefetchedModelPath != nil || hasBundledParakeetModel
+            return (variant == modelVariant && prefetchedModelPath != nil)
+                || ModelCacheInventory.activeParakeetModelDirectory(variant: variant) != nil
+                || bundledParakeetModelPath(variant: variant) != nil
         }
     }
-
-    private lazy var hasBundledParakeetModel: Bool =
-        bundledParakeetModelPath() != nil
 
     init() {
         markCachedRuntimeModelIfAvailable()
@@ -2329,6 +2348,7 @@ class ParakeetEngine: ObservableObject {
     private func finishTranscription() {
         isTranscribing = false
         clearRecoveredRecordingTimeline(keepingCapacity: true)
+        finishDeferredModelTeardownIfIdle()
     }
 
     var hasActiveASRWork: Bool {
@@ -2344,6 +2364,7 @@ class ParakeetEngine: ObservableObject {
 
     private func finishPureSampleTranscriptionActivity() {
         pureSampleTranscriptionActivityCount = max(0, pureSampleTranscriptionActivityCount - 1)
+        finishDeferredModelTeardownIfIdle()
     }
 
     private func beginASRInference() async {
@@ -2378,6 +2399,7 @@ class ParakeetEngine: ObservableObject {
             next.resume()
             return
         }
+        finishDeferredModelTeardownIfIdle()
     }
 
     private func runASRInference(
