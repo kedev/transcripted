@@ -104,7 +104,9 @@ extension ParakeetEngine {
         modelDownloadState = .downloading(progress: max(0, min(1, progress)))
     }
 
-    private func scheduleModelDownloadWatchdog(
+    // Internal so the executor integration harness can supply an aged progress
+    // tracker without shortening the production five-minute timeout.
+    func scheduleModelDownloadWatchdog(
         generation: UInt64,
         progressTracker: ParakeetModelDownloadProgressTracker
     ) {
