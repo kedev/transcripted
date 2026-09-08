@@ -205,8 +205,8 @@ Nothing. It's MIT-licensed open source. No account, no trial, no "pro" tier.
 
 **How accurate is it?**
 Good enough to search and quote. Parakeet V3 is the multilingual default;
-Parakeet V2 is an English-only choice in Settings → Model. Whisper is also
-available, and a custom dictionary
+Parakeet V2 is an English-only choice in Settings → Model.
+Whisper is available as an advanced option, and a custom dictionary
 keeps names, acronyms, and project jargon spelled right. Speaker review cleans
 up who-said-what after shared-mic meetings.
 
