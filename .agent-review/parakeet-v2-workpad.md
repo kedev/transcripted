@@ -95,6 +95,6 @@ or recognize grants. They do not imply a live-capture pass.
   must-fix. Rejected review suggestion: delete legacy v2 cache unconditionally.
   Historical FluidAudio 0.7.9 inspection showed it already used the compatible
   modern layout, so guarded migration/preservation is safer than data deletion.
-- Keep the PR draft until human review. No related issue currently exists;
+- Keep the PR draft until human review. No related issue has been identified for this contribution;
   this branch-local workpad supplies the agent-workpad context without inventing
   an issue or publishing one on the contributor's behalf.
