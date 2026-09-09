@@ -168,8 +168,8 @@ func testDictationRecordingStartOverlayPolicy() {
 
         assertEqual(
             message,
-            "Bluetooth audio blocked the mic. Try again.",
-            "Bluetooth fallback timeouts should tell users what changed instead of blaming only the selected mic"
+            "Built-in mic unavailable. Choose another input.",
+            "fallback timeouts should name the failed selected input without claiming Bluetooth caused the failure"
         )
     }
 
@@ -189,8 +189,8 @@ func testDictationRecordingStartOverlayPolicy() {
 
         assertEqual(
             message,
-            "Bluetooth audio blocked the mic. Try again.",
-            "Bluetooth fallback start failures should not fall through to generic microphone copy"
+            "Built-in mic unavailable. Choose another input.",
+            "fallback start failures should identify the unavailable built-in microphone"
         )
     }
 

@@ -355,7 +355,12 @@ enum ParakeetAudioFormatReadinessPolicy {
             return .routeNotSettled
         }
 
-        if suppressedRecoveryBluetoothRoute, lowRateOutputBus {
+        // A native headset can legitimately capture at 8/16/24 kHz on both
+        // buses. The recovery fallback explicitly selects that headset, so a
+        // matched speech format must be allowed to start. Only keep waiting
+        // when the low-rate bus still disagrees with the hardware snapshot.
+        if suppressedRecoveryBluetoothRoute, lowRateOutputBus,
+           inputSampleRate != outputSampleRate {
             return .routeNotSettled
         }
 

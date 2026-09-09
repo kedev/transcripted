@@ -36,7 +36,7 @@
 import Foundation
 
 func testBluetoothRouteContract() {
-    runSuite("Bluetooth route contract - output plus built-in mic fallback stays explicit") {
+    runSuite("Bluetooth route contract - opt-in built-in mic recommendation stays explicit") {
         let airPodsInput = bluetoothDevice(1, "Justin's AirPods Pro", inputChannels: 1)
         let airPodsOutput = bluetoothDevice(2, "Justin's AirPods Pro", inputChannels: 0)
         let macBookMic = bluetoothRouteBuiltInDevice(3, "MacBook Pro Microphone")
@@ -44,10 +44,11 @@ func testBluetoothRouteContract() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
-        assertEqual(selection.selectedInput, macBookMic, "Bluetooth headset playback should use the local built-in mic when available")
+        assertEqual(selection.selectedInput, macBookMic, "the faster-start opt-in should recommend the local built-in mic when available")
         assertEqual(selection.defaultOutput, airPodsOutput, "Bluetooth output should remain visible in the mocked route")
         assertEqual(selection.reason, .preferredBuiltInForBluetoothHeadset, "fallback reason should stay queryable in logs and tests")
         assertTrue(selection.didOverrideDefault, "built-in fallback should be reported as an input override")
@@ -116,6 +117,7 @@ func testBluetoothRouteContract() {
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
             availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -269,7 +271,7 @@ func testBluetoothRouteContract() {
         assertTrue(state.canStartRecording, "successful latest recovery should unblock dictation starts")
     }
 
-    runSuite("Bluetooth route contract - mocked device changes settle through connect and disconnect") {
+    runSuite("Bluetooth route contract - opt-in mocked device changes settle through connect and disconnect") {
         let airPodsInput = bluetoothDevice(1, "Justin's AirPods Pro", inputChannels: 1)
         let airPodsOutput = bluetoothDevice(2, "Justin's AirPods Pro", inputChannels: 0)
         let macBookMic = bluetoothRouteBuiltInDevice(3, "MacBook Pro Microphone")
@@ -335,7 +337,8 @@ func testBluetoothRouteContract() {
         let headsetConnect = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
         let lowRateReadiness = readiness(
             for: headsetConnect,

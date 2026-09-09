@@ -12,8 +12,14 @@ enum MeetingAudioTransport: String {
     case other
 }
 
-enum MeetingInputDeviceSelectionMode: String {
+/// The host's microphone choice for a new meeting. Neither mode changes the
+/// macOS default input or output device.
+public enum MeetingInputDeviceSelectionMode: String, Sendable {
+    /// Prefer a built-in microphone when a Bluetooth headset is the default
+    /// input and output, avoiding contention with the call app's headset mic.
     case automatic
+    /// Start on the macOS input, including a deliberately selected headset.
+    /// A detected Bluetooth route failure may still use the bounded fallback.
     case preserveDefault
 }
 
@@ -49,21 +55,30 @@ enum MeetingInputDeviceSelectionPolicy {
         case sampleRateMismatch = "sample_rate_mismatch"
     }
 
-    /// Meeting capture must not pin the same Bluetooth headset input used by a
-    /// call app. That HFP route can leave the other app unable to transmit mic
-    /// audio until Transcripted quits. Prefer a built-in input at meeting start
-    /// while leaving USB and other safe defaults unchanged.
+    /// Automatic mode isolates the call app's Bluetooth mic. An explicit host
+    /// preference may instead preserve the macOS input for this recording.
     static func selectionForMeetingStart(
         defaultInput: MeetingAudioDevice,
         defaultOutput: MeetingAudioDevice?,
-        availableInputs: [MeetingAudioDevice]
+        availableInputs: [MeetingAudioDevice],
+        mode: MeetingInputDeviceSelectionMode = .automatic
     ) -> MeetingInputDeviceSelection {
         selection(
             defaultInput: defaultInput,
             defaultOutput: defaultOutput,
             availableInputs: availableInputs,
-            mode: .automatic
+            mode: mode
         )
+    }
+
+    static func shouldAttemptBuiltInStabilization(
+        routeWasUnstable: Bool,
+        selectedInput: MeetingAudioDevice,
+        stabilizationAlreadyAttempted: Bool
+    ) -> Bool {
+        routeWasUnstable
+            && (selectedInput.transport == .bluetooth || selectedInput.transport == .bluetoothLE)
+            && !stabilizationAlreadyAttempted
     }
 
     static func selectionAfterStabilizationAttempt(
@@ -88,13 +103,24 @@ enum MeetingInputDeviceSelectionPolicy {
         outcome == .switchFailed
     }
 
+    static func outcomeAfterLookupFailure(
+        mode: MeetingInputDeviceSelectionMode
+    ) -> CaptureRouteStabilizationOutcome {
+        mode == .preserveDefault ? .switchFailed : .notNeeded
+    }
+
     static func outcomeAfterApplicationFailure(
         selectionReason: MeetingInputDeviceSelectionReason,
         requestedOutcome: CaptureRouteStabilizationOutcome
     ) -> CaptureRouteStabilizationOutcome {
-        selectionReason == .preferredBuiltInForBluetoothHeadset
-            ? .switchFailed
-            : requestedOutcome
+        switch selectionReason {
+        case .preferredBuiltInForBluetoothHeadset, .preservedDefaultInput:
+            // An unapplied explicit choice must not become a nil selection
+            // that lets route readiness accept the node's previous device.
+            return .switchFailed
+        case .defaultIsSafe, .noBuiltInFallbackAvailable:
+            return requestedOutcome
+        }
     }
 
     static func routeReadiness(
@@ -145,21 +171,21 @@ enum MeetingInputDeviceSelectionPolicy {
         availableInputs: [MeetingAudioDevice],
         mode: MeetingInputDeviceSelectionMode = .automatic
     ) -> MeetingInputDeviceSelection {
-        guard shouldAvoidBluetoothHeadsetInput(defaultInput, defaultOutput: defaultOutput) else {
-            return MeetingInputDeviceSelection(
-                defaultInput: defaultInput,
-                selectedInput: defaultInput,
-                defaultOutput: defaultOutput,
-                reason: .defaultIsSafe
-            )
-        }
-
         guard mode == .automatic else {
             return MeetingInputDeviceSelection(
                 defaultInput: defaultInput,
                 selectedInput: defaultInput,
                 defaultOutput: defaultOutput,
                 reason: .preservedDefaultInput
+            )
+        }
+
+        guard shouldAvoidBluetoothHeadsetInput(defaultInput, defaultOutput: defaultOutput) else {
+            return MeetingInputDeviceSelection(
+                defaultInput: defaultInput,
+                selectedInput: defaultInput,
+                defaultOutput: defaultOutput,
+                reason: .defaultIsSafe
             )
         }
 
@@ -287,7 +313,9 @@ enum MeetingInputDeviceSelectionPolicy {
 }
 
 private enum MeetingInputDeviceLookup {
-    static func preferredInputSelection() throws -> MeetingInputDeviceSelection {
+    static func preferredInputSelection(
+        mode: MeetingInputDeviceSelectionMode
+    ) throws -> MeetingInputDeviceSelection {
         let defaultInputID = try AudioObjectID.readDefaultInputDevice()
         var availableInputs = try allInputDevices()
 
@@ -307,7 +335,8 @@ private enum MeetingInputDeviceLookup {
         return MeetingInputDeviceSelectionPolicy.selectionForMeetingStart(
             defaultInput: defaultInput,
             defaultOutput: defaultOutput,
-            availableInputs: availableInputs
+            availableInputs: availableInputs,
+            mode: mode
         )
     }
 
@@ -465,13 +494,17 @@ extension Audio {
         var selection = meetingInputSelectionSnapshot()
         if selection == nil {
             do {
-                selection = try MeetingInputDeviceLookup.preferredInputSelection()
+                selection = try MeetingInputDeviceLookup.preferredInputSelection(
+                    mode: meetingInputDeviceSelectionModeForCurrentRecording
+                )
             } catch {
                 AppLogger.audioMic.warning("Meeting input selection unavailable", [
                     "operation": operation,
                     "error": error.localizedDescription
                 ])
-                return .notNeeded
+                return MeetingInputDeviceSelectionPolicy.outcomeAfterLookupFailure(
+                    mode: meetingInputDeviceSelectionModeForCurrentRecording
+                )
             }
         }
 
@@ -479,15 +512,18 @@ extension Audio {
             AppLogger.audioMic.warning("Meeting input selection unavailable", [
                 "operation": operation
             ])
-            return .notNeeded
+            return MeetingInputDeviceSelectionPolicy.outcomeAfterLookupFailure(
+                mode: meetingInputDeviceSelectionModeForCurrentRecording
+            )
         }
 
         var stabilizationOutcome = CaptureRouteStabilizationOutcome.notNeeded
         let stabilizationAlreadyAttempted = meetingRouteStabilizationOutcomeValue != CaptureRouteStabilizationOutcome.notNeeded.rawValue
-        let selectedInputIsBluetooth = selection.selectedInput.transport == .bluetooth
-            || selection.selectedInput.transport == .bluetoothLE
-
-        if routeWasUnstable, selectedInputIsBluetooth, !stabilizationAlreadyAttempted {
+        if MeetingInputDeviceSelectionPolicy.shouldAttemptBuiltInStabilization(
+            routeWasUnstable: routeWasUnstable,
+            selectedInput: selection.selectedInput,
+            stabilizationAlreadyAttempted: stabilizationAlreadyAttempted
+        ) {
             do {
                 guard let builtInInput = try MeetingInputDeviceLookup.preferredBuiltInFallback(
                     for: selection.selectedInput
@@ -609,7 +645,10 @@ extension Audio {
                 selectionReason: selection.reason,
                 requestedOutcome: stabilizationOutcome
             )
-            if outcome == .switchFailed {
+            // An explicit-device bind failure aborts this graph attempt too,
+            // but is not evidence of a failed Bluetooth-to-built-in switch.
+            if outcome == .switchFailed,
+               selection.reason == .preferredBuiltInForBluetoothHeadset {
                 setMeetingRouteStabilizationOutcome(.switchFailed)
                 let retryableLifecycleOperation = operation.hasPrefix("start_recording")
                     || operation.hasPrefix("device_recovery")

@@ -250,6 +250,24 @@ func testDictationInputDeviceSelectionPolicy() {
         )
     }
 
+    runSuite("DictationInputDeviceSelectionPolicy follows the selected AirPods mic by default") {
+        let headset = device(1, "Bluetooth Input", .bluetooth)
+        let output = device(2, "Bluetooth Output", .bluetooth, inputChannels: 0)
+        let builtIn = device(3, "Built-In Microphone", .builtIn)
+        let display = device(4, "Studio Display Microphone", .builtIn)
+
+        for defaultOutput in [output, nil] {
+            let selection = DictationInputDeviceSelectionPolicy.selection(
+                defaultInput: headset,
+                defaultOutput: defaultOutput,
+                availableInputs: [headset, builtIn, display]
+            )
+            assertEqual(selection.selectedInput, headset, "normal dictation must use the chosen headset even when a local mic is listed")
+            assertFalse(selection.didOverrideDefault, "Bluetooth playback must not silently change the microphone")
+            assertEqual(selection.reason, .defaultIsSafe, "following the selected mic is the normal route")
+        }
+    }
+
     runSuite("DictationInputDeviceSelectionPolicy chooses MacBook mic for AirPods input/output") {
         let airPodsInput = device(1, "Justin's AirPods Pro", .bluetooth)
         let airPodsOutput = device(2, "Justin's AirPods Pro", .bluetooth, inputChannels: 0)
@@ -258,7 +276,8 @@ func testDictationInputDeviceSelectionPolicy() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
         assertEqual(selection.selectedInput, macBookMic, "AirPods mic should fall back to the local MacBook mic")
@@ -275,7 +294,8 @@ func testDictationInputDeviceSelectionPolicy() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, displayMic, macBookMic]
+            availableInputs: [airPodsInput, displayMic, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
         assertEqual(selection.selectedInput, macBookMic, "MacBook mic should be the first built-in fallback")
@@ -290,6 +310,7 @@ func testDictationInputDeviceSelectionPolicy() {
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
             availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -308,6 +329,7 @@ func testDictationInputDeviceSelectionPolicy() {
             defaultInput: headsetInput,
             defaultOutput: headsetOutput,
             availableInputs: [headsetInput, displayMic, builtInMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -324,6 +346,7 @@ func testDictationInputDeviceSelectionPolicy() {
             defaultInput: headsetInput,
             defaultOutput: nil,
             availableInputs: [headsetInput, builtInMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -340,6 +363,7 @@ func testDictationInputDeviceSelectionPolicy() {
             defaultInput: usbMic,
             defaultOutput: headsetOutput,
             availableInputs: [usbMic, builtInMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -356,6 +380,7 @@ func testDictationInputDeviceSelectionPolicy() {
             defaultInput: headsetInput,
             defaultOutput: speakers,
             availableInputs: [headsetInput, builtInMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -371,7 +396,8 @@ func testDictationInputDeviceSelectionPolicy() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: speakers,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
         assertEqual(selection.selectedInput, airPodsInput, "non-Bluetooth output should preserve the user's chosen input")
@@ -386,7 +412,8 @@ func testDictationInputDeviceSelectionPolicy() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: usbMic,
             defaultOutput: airPodsOutput,
-            availableInputs: [usbMic, macBookMic]
+            availableInputs: [usbMic, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
         assertEqual(selection.selectedInput, usbMic, "USB mics should stay selected")
@@ -466,7 +493,8 @@ func testDictationInputDeviceSelectionPolicy() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput]
+            availableInputs: [airPodsInput],
+            prefersBuiltInBluetoothInput: true
         )
 
         assertEqual(selection.selectedInput, airPodsInput, "without a local mic fallback, dictation should still work")

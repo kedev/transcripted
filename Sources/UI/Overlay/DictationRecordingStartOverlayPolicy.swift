@@ -92,7 +92,7 @@ struct DictationMicrophoneTimeoutPresentationPolicy {
         routeContext: [String: String] = [:]
     ) -> String {
         if isBluetoothFallbackRoute(routeContext) {
-            return "Bluetooth audio blocked the mic. Try again."
+            return "Built-in mic unavailable. Choose another input."
         }
 
         if startAttempts > 0, inputFormatReady {
