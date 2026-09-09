@@ -701,11 +701,37 @@ public class Audio: ObservableObject, @unchecked Sendable {
     // Meeting input is selected once at start and then pinned for the session.
     // Recovery may make one bounded built-in fallback after a real Bluetooth
     // mic outage, but it must never follow a changing system default forever.
+    private var _meetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode = .automatic
+    private var _activeMeetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode = .automatic
     private var _meetingInputSelection: MeetingInputDeviceSelection?
     private var _meetingRouteStabilizationAttemptCount = 0
     private var _meetingRouteStabilizationOutcome: CaptureRouteStabilizationOutcome = .notNeeded
     private var _meetingRouteStabilityWarningEmitted = false
     private let meetingRouteStateLock = NSLock()
+
+    /// The host's microphone preference for the next recording. Set before
+    /// `start()`. The active recording retains its start-time mode through
+    /// recovery; changing this property only affects the next recording.
+    /// Preserving the macOS input still permits the existing bounded built-in
+    /// fallback after an actual Bluetooth route failure.
+    public var meetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode {
+        get {
+            meetingRouteStateLock.lock()
+            defer { meetingRouteStateLock.unlock() }
+            return _meetingInputDeviceSelectionMode
+        }
+        set {
+            meetingRouteStateLock.lock()
+            _meetingInputDeviceSelectionMode = newValue
+            meetingRouteStateLock.unlock()
+        }
+    }
+
+    var meetingInputDeviceSelectionModeForCurrentRecording: MeetingInputDeviceSelectionMode {
+        meetingRouteStateLock.lock()
+        defer { meetingRouteStateLock.unlock() }
+        return _activeMeetingInputDeviceSelectionMode
+    }
 
     var meetingInputSelectionReasonValue: String {
         meetingRouteStateLock.lock()
@@ -774,8 +800,11 @@ public class Audio: ObservableObject, @unchecked Sendable {
         meetingRouteStateLock.unlock()
     }
 
-    func resetMeetingRouteState() {
+    func resetMeetingRouteState(forNewRecording: Bool = false) {
         meetingRouteStateLock.lock()
+        if forNewRecording {
+            _activeMeetingInputDeviceSelectionMode = _meetingInputDeviceSelectionMode
+        }
         _meetingInputSelection = nil
         _meetingRouteStabilizationAttemptCount = 0
         _meetingRouteStabilizationOutcome = .notNeeded
@@ -2046,7 +2075,7 @@ public class Audio: ObservableObject, @unchecked Sendable {
         micHostPCMBufferFanout.begin(generation: sessionGeneration)
         writeBackpressureStopAdmission.begin(generation: sessionGeneration)
         beginWriteErrorTracking(generation: sessionGeneration)
-        resetMeetingRouteState()
+        resetMeetingRouteState(forNewRecording: true)
         recordVoiceProcessingStartFallback(.none)
 
         // Reset capture artifacts so a previous session cannot make a new start

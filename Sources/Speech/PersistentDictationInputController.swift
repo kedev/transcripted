@@ -249,7 +249,9 @@ final class PersistentDictationInputController {
         guard !runtimeOwnershipRelinquished else { return }
 
         do {
-            let selection = try CoreAudioInputDeviceLookup.preferredDictationInputSelection()
+            let selection = try CoreAudioInputDeviceLookup.preferredDictationInputSelection(
+                prefersBuiltInBluetoothInput: true
+            )
             let availableInputs = try CoreAudioInputDeviceLookup.availableInputDevices()
             if activeOverride == nil,
                let marker = DictationPersistentInputPreferences.recoveryMarker(),

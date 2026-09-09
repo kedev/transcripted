@@ -147,6 +147,8 @@ final class MeetingCaptureBridge: ObservableObject {
         // Read once at start; mid-session changes don't take effect until the
         // next recording except the explicit Boost Mic consent path below.
         let micProcessingMode = MicrophoneProcessingPreferences.mode()
+        audio.meetingInputDeviceSelectionMode = MeetingMicrophonePreferences.usesSystemInput()
+            ? .preserveDefault : .automatic
         audio.enableVoiceProcessing = micProcessingMode.usesAppleVoiceProcessing
         audio.enableSoftwareAGC = micProcessingMode.allowsSoftwareAutogainFallback
 

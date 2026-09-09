@@ -6,6 +6,35 @@ import Combine
 @available(macOS 14.0, *)
 final class AudioInitializationTests: XCTestCase {
 
+    func testMeetingInputModeIsCapturedForTheRecordingAndSurvivesRecoveryReset() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AudioInitializationTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let audio = Audio(paths: makeCoreStoragePaths(root: root))
+        XCTAssertEqual(audio.meetingInputDeviceSelectionMode, .automatic)
+        XCTAssertEqual(audio.meetingInputDeviceSelectionModeForCurrentRecording, .automatic)
+
+        audio.meetingInputDeviceSelectionMode = .preserveDefault
+        audio.prepareForNewRecordingStart()
+        XCTAssertEqual(audio.meetingInputDeviceSelectionModeForCurrentRecording, .preserveDefault)
+
+        audio.meetingInputDeviceSelectionMode = .automatic
+        audio.resetMeetingRouteState()
+        XCTAssertEqual(
+            audio.meetingInputDeviceSelectionModeForCurrentRecording,
+            .preserveDefault,
+            "a recovery retry must retain the current meeting's explicit microphone mode"
+        )
+
+        audio.prepareForNewRecordingStart()
+        XCTAssertEqual(
+            audio.meetingInputDeviceSelectionModeForCurrentRecording,
+            .automatic,
+            "a preference change applies when the next meeting begins"
+        )
+    }
+
     func testMicRecoveryOnlySucceedsAfterANewBuffer() {
         XCTAssertFalse(
             MicRecoveryReadinessPolicy.deliveredNewBuffer(before: 10, after: 10),

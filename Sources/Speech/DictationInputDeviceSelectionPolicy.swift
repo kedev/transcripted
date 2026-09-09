@@ -1,5 +1,5 @@
 // DictationInputDeviceSelectionPolicy.swift
-// Keeps Bluetooth headset microphones from taking over music playback when a local mic is available.
+// Follows the selected Mac input unless the user opts into a local-mic recommendation.
 
 import Foundation
 
@@ -113,9 +113,14 @@ enum DictationInputDeviceSelectionPolicy {
         defaultInput: DictationAudioDevice,
         defaultOutput: DictationAudioDevice?,
         availableInputs: [DictationAudioDevice],
+        prefersBuiltInBluetoothInput: Bool = false,
         allowsBuiltInBluetoothFallback: Bool = true
     ) -> DictationInputDeviceSelection {
-        guard shouldAvoidBluetoothHeadsetInput(defaultInput, defaultOutput: defaultOutput) else {
+        // A visible built-in device is not proof that it can hear the user.
+        // Normal dictation follows macOS; only the explicit faster-start mode
+        // may recommend a different microphone to preserve Bluetooth playback.
+        guard prefersBuiltInBluetoothInput,
+              shouldAvoidBluetoothHeadsetInput(defaultInput, defaultOutput: defaultOutput) else {
             return DictationInputDeviceSelection(
                 defaultInput: defaultInput,
                 selectedInput: defaultInput,

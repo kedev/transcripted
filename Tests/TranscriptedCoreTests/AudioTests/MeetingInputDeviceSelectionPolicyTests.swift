@@ -161,6 +161,51 @@ final class MeetingInputDeviceSelectionPolicyTests: XCTestCase {
         )
     }
 
+    func testFailedExplicitInputBindAbortsBeforeAnUnselectedRouteCanBecomeReady() {
+        let bluetoothMic = device(id: 10, name: "AirPods Pro", transport: .bluetooth, channels: 1)
+        let usbMic = device(id: 20, name: "USB Microphone", transport: .usb, channels: 1)
+        let builtInMic = device(id: 30, name: "MacBook Pro Microphone", transport: .builtIn, channels: 1)
+
+        for selectedMic in [bluetoothMic, usbMic, builtInMic] {
+            let attemptedSelection = MeetingInputDeviceSelectionPolicy.selectionForMeetingStart(
+                defaultInput: selectedMic,
+                defaultOutput: bluetoothMic,
+                availableInputs: [bluetoothMic, usbMic, builtInMic],
+                mode: .preserveDefault
+            )
+            XCTAssertEqual(attemptedSelection.reason, .preservedDefaultInput)
+            XCTAssertNil(MeetingInputDeviceSelectionPolicy.selectionAfterApplicationAttempt(
+                currentSelection: nil,
+                attemptedSelection: attemptedSelection,
+                didApplySelection: false
+            ))
+
+            let outcome = MeetingInputDeviceSelectionPolicy.outcomeAfterApplicationFailure(
+                selectionReason: attemptedSelection.reason,
+                requestedOutcome: .notNeeded
+            )
+            XCTAssertEqual(outcome, .switchFailed)
+            XCTAssertTrue(
+                MeetingInputDeviceSelectionPolicy.shouldAbortMeetingStart(after: outcome),
+                "a failed explicit bind must not reach routeReadiness with nil selection and use the previous mic"
+            )
+        }
+    }
+
+    func testExplicitInputLookupFailureCannotProceedWithAnUnknownMicrophone() {
+        let explicitOutcome = MeetingInputDeviceSelectionPolicy.outcomeAfterLookupFailure(
+            mode: .preserveDefault
+        )
+        XCTAssertEqual(explicitOutcome, .switchFailed)
+        XCTAssertTrue(MeetingInputDeviceSelectionPolicy.shouldAbortMeetingStart(after: explicitOutcome))
+
+        let automaticOutcome = MeetingInputDeviceSelectionPolicy.outcomeAfterLookupFailure(
+            mode: .automatic
+        )
+        XCTAssertEqual(automaticOutcome, .notNeeded)
+        XCTAssertFalse(MeetingInputDeviceSelectionPolicy.shouldAbortMeetingStart(after: automaticOutcome))
+    }
+
     func testMeetingStartAvoidsSharingBluetoothHeadsetMicWithCallApps() {
         let bluetoothMic = device(
             id: 10,
@@ -184,6 +229,56 @@ final class MeetingInputDeviceSelectionPolicyTests: XCTestCase {
         XCTAssertEqual(selection.selectedInput, macBookMic)
         XCTAssertEqual(selection.reason, .preferredBuiltInForBluetoothHeadset)
         XCTAssertTrue(selection.didOverrideDefault)
+    }
+
+    func testMeetingStartHonorsExplicitMacOSMicrophoneMode() {
+        let bluetoothMic = device(id: 10, name: "AirPods Pro", transport: .bluetooth, channels: 1)
+        let builtInMic = device(id: 20, name: "MacBook Pro Microphone", transport: .builtIn, channels: 1)
+
+        for output in [bluetoothMic, nil] as [MeetingAudioDevice?] {
+            let selection = MeetingInputDeviceSelectionPolicy.selectionForMeetingStart(
+                defaultInput: bluetoothMic,
+                defaultOutput: output,
+                availableInputs: [bluetoothMic, builtInMic],
+                mode: .preserveDefault
+            )
+
+            XCTAssertEqual(selection.selectedInput, bluetoothMic)
+            XCTAssertEqual(selection.reason, .preservedDefaultInput)
+            XCTAssertFalse(selection.didOverrideDefault)
+        }
+    }
+
+    func testExplicitMacOSMicrophoneModeRetainsBoundedFailureFallback() {
+        let bluetoothMic = device(id: 10, name: "AirPods Pro", transport: .bluetooth, channels: 1)
+        let builtInMic = device(id: 20, name: "MacBook Pro Microphone", transport: .builtIn, channels: 1)
+        let selection = MeetingInputDeviceSelectionPolicy.selectionForMeetingStart(
+            defaultInput: bluetoothMic,
+            defaultOutput: bluetoothMic,
+            availableInputs: [bluetoothMic, builtInMic],
+            mode: .preserveDefault
+        )
+
+        XCTAssertFalse(MeetingInputDeviceSelectionPolicy.shouldAttemptBuiltInStabilization(
+            routeWasUnstable: false,
+            selectedInput: selection.selectedInput,
+            stabilizationAlreadyAttempted: false
+        ), "an intentional Bluetooth input must not switch just because capture starts or processing restarts")
+        XCTAssertTrue(MeetingInputDeviceSelectionPolicy.shouldAttemptBuiltInStabilization(
+            routeWasUnstable: true,
+            selectedInput: selection.selectedInput,
+            stabilizationAlreadyAttempted: false
+        ), "preserving the macOS input must not disable recovery after a real route failure")
+        XCTAssertFalse(MeetingInputDeviceSelectionPolicy.shouldAttemptBuiltInStabilization(
+            routeWasUnstable: true,
+            selectedInput: selection.selectedInput,
+            stabilizationAlreadyAttempted: true
+        ), "the existing stabilization attempt stays bounded")
+        XCTAssertFalse(MeetingInputDeviceSelectionPolicy.shouldAttemptBuiltInStabilization(
+            routeWasUnstable: true,
+            selectedInput: builtInMic,
+            stabilizationAlreadyAttempted: false
+        ))
     }
 
     func testFailedBuiltInStabilizationRestoresPinnedBluetoothSelection() {
