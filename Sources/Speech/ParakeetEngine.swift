@@ -51,7 +51,10 @@ class ParakeetEngine: ObservableObject {
     nonisolated let sharedMeetingMicRecorder = SharedMeetingMicRecorder()
     var sharedMeetingMicTransition = SharedMeetingMicTransitionState()
     // Completed tap batches and recovery segments share one rate-aware timeline.
-    var recoveredRecordingTimeline = RecordedAudioTimeline()
+    private var recordedSamplesRevision: UInt64 = 0
+    var recoveredRecordingTimeline = RecordedAudioTimeline() {
+        didSet { recordedSamplesRevision &+= 1 }
+    }
     var preservingRecordingAcrossRecovery = false
     private nonisolated(unsafe) var nativeSampleRate: Double = 48000
     private nonisolated(unsafe) var audioStartReferenceTime: CFAbsoluteTime?
@@ -108,7 +111,7 @@ class ParakeetEngine: ObservableObject {
     private var zombieRecoveryRestartPending: Bool { zombieRecoveryState.isActive }
     private var asrInferenceActivity = ParakeetASRInferenceActivityState()
     private var asrInferenceHandoffCount = 0
-    private var asrInferenceWaiters: [CheckedContinuation<Void, Never>] = []
+    private let asrInferenceWaiters = ASRInferenceWaiterQueue()
     private var pureSampleTranscriptionActivityCount = 0
     var asrManagerReady = false
     nonisolated(unsafe) var didReceiveAudioSamples = false
@@ -2089,40 +2092,7 @@ class ParakeetEngine: ObservableObject {
     }
 
     private func extractMonoSamples(from buffer: AVAudioPCMBuffer) -> [Float]? {
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-
-        guard frameCount > 0, channelCount > 0 else { return [] }
-
-        if channelCount == 1 {
-            guard let channelData = buffer.floatChannelData?[0] else { return nil }
-            return Array(UnsafeBufferPointer(start: channelData, count: frameCount))
-        }
-
-        var monoSamples = Array<Float>(repeating: 0, count: frameCount)
-
-        if buffer.format.isInterleaved {
-            guard let interleavedData = buffer.floatChannelData?[0] else { return nil }
-            for frame in 0..<frameCount {
-                let baseIndex = frame * channelCount
-                var sum: Float = 0
-                for channel in 0..<channelCount {
-                    sum += interleavedData[baseIndex + channel]
-                }
-                monoSamples[frame] = sum / Float(channelCount)
-            }
-            return monoSamples
-        }
-
-        guard let channelData = buffer.floatChannelData else { return nil }
-        for frame in 0..<frameCount {
-            var sum: Float = 0
-            for channel in 0..<channelCount {
-                sum += channelData[channel][frame]
-            }
-            monoSamples[frame] = sum / Float(channelCount)
-        }
-        return monoSamples
+        MicrophoneDownmix.monoSamples(from: buffer)
     }
 
     func currentAudioGraphOwnerToken() -> ParakeetAudioGraphOwnerToken {
@@ -2332,9 +2302,12 @@ class ParakeetEngine: ObservableObject {
 
     private func drainRecordedSamplesForInference() async -> (nativeSampleCount: Int, samples16k: [Float])? {
         drainPendingSamplesIntoTimeline()
-        let segments = recoveredRecordingTimeline.drain()
-        preservingRecordingAcrossRecovery = false
-        guard let recorded = await Self.resampleRecordedSegments(segments) else { return nil }
+        // Keep native audio until conversion succeeds. A converter failure is
+        // retryable and must not consume the only surviving recording.
+        let claim = ParakeetRecordedSamplesClaim(graphOwner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision)
+        guard let recorded = await resampleRecordedSegments(recoveredRecordingTimeline.segments),
+              claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+        clearRecoveredRecordingTimeline(keepingCapacity: true)
         return (recorded.nativeSampleCount, recorded.samples16k)
     }
 
@@ -2358,24 +2331,36 @@ class ParakeetEngine: ObservableObject {
     func snapshotRecordedSamplesForPersistence() async -> RecordedSpeechSamples? {
         drainPendingSamplesIntoTimeline()
 
-        return await Self.resampleRecordedSegments(recoveredRecordingTimeline.segments)
+        return await resampleRecordedSegments(recoveredRecordingTimeline.segments)
     }
 
-    private static func resampleRecordedSegments(_ segments: [RecordedAudioSegment]) async -> RecordedSpeechSamples? {
+    private func resampleRecordedSegments(_ segments: [RecordedAudioSegment]) async -> RecordedSpeechSamples? {
         let nativeSampleCount = segments.reduce(0) { $0 + $1.samples.count }
         guard nativeSampleCount > 0 else { return nil }
-        let samples16k = await Task.detached(priority: .userInitiated) {
-            var combined: [Float] = []
-            for segment in segments {
-                combined.append(contentsOf: AudioResampler.resample(
-                    segment.samples,
-                    from: segment.sampleRate,
-                    to: TranscriptedConstants.parakeetSampleRate
-                ))
-            }
-            return combined
-        }.value
-        return RecordedSpeechSamples(nativeSampleCount: nativeSampleCount, samples16k: samples16k)
+        let claim = ParakeetRecordedSamplesClaim(graphOwner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision)
+        do {
+            let samples16k = try await Task.detached(priority: .userInitiated) {
+                var combined: [Float] = []
+                for segment in segments {
+                    combined.append(contentsOf: try AudioResampler.resampleForSpeech(
+                        segment.samples,
+                        from: segment.sampleRate,
+                        to: TranscriptedConstants.parakeetSampleRate
+                    ))
+                }
+                return combined
+            }.value
+            guard claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+            return RecordedSpeechSamples(nativeSampleCount: nativeSampleCount, samples16k: samples16k)
+        } catch {
+            guard claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+            lastEmptyTranscriptionReason = .modelFailure
+            EventReporter.shared.capture(
+                level: .error, engine: "parakeet", event: "audio_conversion_failed",
+                message: "Recorded audio conversion failed; native samples retained for retry"
+            )
+            return nil
+        }
     }
 
     // MARK: - Transcription
@@ -2409,8 +2394,19 @@ class ParakeetEngine: ObservableObject {
         }
 
         isTranscribing = true
-        guard let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording) else {
-            finishExternalTranscription()
+        let conversionOwner = currentAudioGraphOwnerToken()
+        let conversionRevision = recordedSamplesRevision
+        let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording)
+        guard ownsAudioGraph(conversionOwner) else { return nil }
+        if Task.isCancelled {
+            if recorded != nil || recordedSamplesRevision == conversionRevision {
+                finishTranscription()
+            }
+            return nil
+        }
+        guard let recorded else {
+            guard recordedSamplesRevision == conversionRevision else { return nil }
+            isTranscribing = false
             return nil
         }
         let nativeCount = recorded.nativeSampleCount
@@ -2463,7 +2459,8 @@ class ParakeetEngine: ObservableObject {
         pureSampleTranscriptionActivityCount = max(0, pureSampleTranscriptionActivityCount - 1)
     }
 
-    private func beginASRInference() async {
+    private func beginASRInference() async throws {
+        try Task.checkCancellation()
         if asrInferenceActivity.canStartImmediately(reservedHandoffCount: asrInferenceHandoffCount) {
             asrInferenceActivity.begin()
             return
@@ -2480,19 +2477,16 @@ class ParakeetEngine: ObservableObject {
                 "waiter_count": "\(asrInferenceWaiters.count)"
             ]
         )
-        await withCheckedContinuation { continuation in
-            asrInferenceWaiters.append(continuation)
-        }
+        try await asrInferenceWaiters.wait()
         asrInferenceHandoffCount = max(0, asrInferenceHandoffCount - 1)
         asrInferenceActivity.begin()
     }
 
     private func finishASRInference() {
         asrInferenceActivity.finish()
-        if let next = asrInferenceWaiters.first {
-            asrInferenceWaiters.removeFirst()
+        if !asrInferenceWaiters.isEmpty {
             asrInferenceHandoffCount += 1
-            next.resume()
+            asrInferenceWaiters.resumeFirst()
             return
         }
     }
@@ -2501,7 +2495,17 @@ class ParakeetEngine: ObservableObject {
         manager: AsrManager,
         samples: [Float]
     ) async throws -> String {
-        await beginASRInference()
+        let queueStartedAt = ProcessInfo.processInfo.systemUptime
+        try await beginASRInference()
+        let inferenceStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            let finishedAt = ProcessInfo.processInfo.systemUptime
+            let queueWaitMS = (inferenceStartedAt - queueStartedAt) * 1_000
+            let inferenceMS = (finishedAt - inferenceStartedAt) * 1_000
+            // Aggregate local diagnostics only; existing end-to-end timing keeps
+            // its semantics and neither samples nor transcript text are logged.
+            AppLogger.transcription.info("PARAKEET | ASR queue_wait_ms=\(String(format: "%.2f", queueWaitMS)) inference_ms=\(String(format: "%.2f", inferenceMS))")
+        }
         do {
             try Task.checkCancellation()
             // FluidAudio 0.15.x hands decoder-state ownership to the caller. Every batch
@@ -2509,8 +2513,10 @@ class ParakeetEngine: ObservableObject {
             // contaminate each other's decoder context (0.7.9 kept per-source state
             // internally, keyed by the removed `source:` parameter).
             let decoderLayers = await manager.decoderLayerCount
+            try Task.checkCancellation()
             var decoderState = try TdtDecoderState(decoderLayers: decoderLayers)
             let result = try await manager.transcribe(samples, decoderState: &decoderState)
+            try Task.checkCancellation()
             let text = withExtendedLifetime(result) {
                 String(result.text)
             }
@@ -2523,6 +2529,7 @@ class ParakeetEngine: ObservableObject {
     }
 
     func transcribe(preparedRecording: RecordedSpeechSamples? = nil) async -> String? {
+        guard !Task.isCancelled else { return nil }
         lastEmptyTranscriptionReason = nil
         guard !isTranscribing else {
             EventReporter.shared.capture(level: .warning, engine: "parakeet", event: "transcription_already_active",
@@ -2546,8 +2553,19 @@ class ParakeetEngine: ObservableObject {
         isTranscribing = true
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        guard let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording) else {
-            finishTranscription()
+        let conversionOwner = currentAudioGraphOwnerToken()
+        let conversionRevision = recordedSamplesRevision
+        let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording)
+        guard ownsAudioGraph(conversionOwner) else { return nil }
+        if Task.isCancelled {
+            if recorded != nil || recordedSamplesRevision == conversionRevision {
+                finishTranscription()
+            }
+            return nil
+        }
+        guard let recorded else {
+            guard recordedSamplesRevision == conversionRevision else { return nil }
+            isTranscribing = false
             return nil
         }
         let nativeCount = recorded.nativeSampleCount
@@ -2642,6 +2660,7 @@ class ParakeetEngine: ObservableObject {
                         emptyContext["retry_elapsed_s"] = String(format: "%.3f", retryElapsed)
                         emptyContext["retry_samples"] = "\(retrySamples.count)"
                     } catch {
+                        if Task.isCancelled || error is CancellationError { throw CancellationError() }
                         emptyContext["retry_error"] = error.localizedDescription
                     }
                 } else if !analysis.hasUsableSpeechSignal {
@@ -2675,6 +2694,10 @@ class ParakeetEngine: ObservableObject {
                 ])
             return corrected
         } catch {
+            if Task.isCancelled || error is CancellationError {
+                if ownsAudioGraph(conversionOwner) { finishTranscription() }
+                return nil
+            }
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             if let fallbackDecision = ParakeetShortAudioGate.dictationFallback(
                 nativeSampleCount: nativeCount,
@@ -2722,6 +2745,7 @@ class ParakeetEngine: ObservableObject {
     /// - Returns: Transcribed text, trimmed. Empty string if Parakeet returned nothing.
     /// - Throws: Re-throws `AsrManager.transcribe` errors (including model-not-ready).
     func transcribeSamples(_ samples: [Float], source: AudioSource) async throws -> String {
+        try Task.checkCancellation()
         beginPureSampleTranscriptionActivity()
         defer { finishPureSampleTranscriptionActivity() }
 
@@ -2757,6 +2781,7 @@ class ParakeetEngine: ObservableObject {
                 samples: samples
             )
         } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
             if let fallbackDecision = ParakeetShortAudioGate.meetingSegmentFallback(
                 sampleCount: samples.count,
                 sourceDescription: sourceDescription,

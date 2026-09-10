@@ -269,23 +269,28 @@ class STTRouter: ObservableObject {
         refreshModelDownloadState()
     }
 
-    /// Wait for the next observable model-load transition. Joins the engine's
-    /// in-flight initialization when one exists — resuming the moment the load
-    /// settles instead of on a polling interval — and falls back to a short
-    /// poll sleep while a download is publishing progress or no
-    /// initialization handle exists (Whisper). Callers own the overall
-    /// timeout and must re-check `isModelLoaded` after each wait.
-    func waitForRecordingModelLoadProgress() async {
+    /// Starts the shared, deduplicated load without tying a UI waiter's deadline
+    /// or cancellation to the model's lifetime.
+    func requestRecordingModelInitialization() {
         let model = recordingModel
-        defer { refreshModelDownloadState() }
-        if model == .parakeetTDTv3 {
-            var isDownloading = false
-            if case .downloading = recordingModelDownloadState { isDownloading = true }
-            if !isDownloading, await parakeetEngine.joinModelInitialization() {
-                return
-            }
+        Task { @MainActor [weak self] in
+            await self?.initialize(model: model)
         }
-        try? await Task.sleep(nanoseconds: TranscriptedConstants.modelLoadPollInterval)
+    }
+
+    /// Wait for a state transition, caller cancellation, or the caller's deadline.
+    /// Ready models return immediately; a stalled native load cannot strand the UI.
+    func waitForRecordingModelLoadProgress(until deadline: TimeInterval) async {
+        guard !isRecordingModelLoaded, !Task.isCancelled,
+              ProcessInfo.processInfo.systemUptime < deadline else { return }
+        let changes: AnyPublisher<Void, Never>
+        if recordingModel == .parakeetTDTv3 {
+            changes = parakeetEngine.$modelDownloadState.dropFirst().map { _ in () }.eraseToAnyPublisher()
+        } else {
+            changes = whisperEngine.$modelDownloadState.dropFirst().map { _ in () }.eraseToAnyPublisher()
+        }
+        await ModelLoadProgressWaiter.wait(for: changes, until: deadline)
+        refreshModelDownloadState()
     }
 
     func startRecording() async -> Bool {
@@ -350,7 +355,9 @@ class STTRouter: ObservableObject {
         switch model {
         case .parakeetTDTv3:
             let text = await parakeetEngine.transcribe(preparedRecording: preparedRecording)
-            lastEmptyTranscriptionReason = text == nil ? parakeetEngine.lastEmptyTranscriptionReason : nil
+            if !Task.isCancelled {
+                lastEmptyTranscriptionReason = text == nil ? parakeetEngine.lastEmptyTranscriptionReason : nil
+            }
             return text
         case .whisperLargeV3Turbo, .whisperLargeV3:
             return await transcribeUsingExternalEngine(
@@ -375,6 +382,7 @@ class STTRouter: ObservableObject {
         transcribe: (RecordedSpeechSamples) async throws -> String
     ) async -> String? {
         await initialize(model: model)
+        guard !Task.isCancelled else { return nil }
         guard isModelLoaded(for: model) else {
             lastEmptyTranscriptionReason = .modelFailure
             EventReporter.shared.capture(
@@ -391,15 +399,19 @@ class STTRouter: ObservableObject {
             engineName: model.engineName,
             preparedRecording: preparedRecording
         ) else {
-            lastEmptyTranscriptionReason = parakeetEngine.lastEmptyTranscriptionReason
+            if !Task.isCancelled { lastEmptyTranscriptionReason = parakeetEngine.lastEmptyTranscriptionReason }
             return nil
         }
 
+        let transcriptionOwner = parakeetEngine.currentAudioGraphOwnerToken()
         do {
             defer {
-                parakeetEngine.finishExternalTranscription()
+                if parakeetEngine.ownsAudioGraph(transcriptionOwner) {
+                    parakeetEngine.finishExternalTranscription()
+                }
             }
             let text = try await transcribe(recording)
+            try Task.checkCancellation()
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 lastEmptyTranscriptionReason = .noSpeech
@@ -407,6 +419,7 @@ class STTRouter: ObservableObject {
             }
             return text
         } catch {
+            if Task.isCancelled || error is CancellationError { return nil }
             lastEmptyTranscriptionReason = .modelFailure
             EventReporter.shared.capture(
                 level: .error,
