@@ -30,6 +30,7 @@
 - `MissedCallNudgePreferences.swift` — persisted (default-on) toggle for the post-call "that call wasn't recorded" nudge; written only by the nudge's "Don't show again" action (the Settings toggle was removed in the 2026-08 settings simplification)
 - `LocalSpeakerPreferences.swift` — persisted toggle for splitting the local mic channel into multiple named speakers during meeting review
 - `MeetingOverlayPillPreferences.swift` — persisted "keep controls visible" pin that opts the meeting pill out of resting to its compact capsule
+- `MeetingMicrophonePreferences.swift` — explicit use of the macOS-selected meeting input, default off to retain Bluetooth call isolation; read before each recording, not during capture
 - `MicrophoneProcessingPreferences.swift` — persisted mic processing mode, toggling between raw/off input, default software AGC, and optional Apple voice processing (VPIO) for users who need the WebRTC-specific recovery path in meetings or dictation
 - `ModelCacheInventory.swift` — scans and cleans known local model cache roots for Settings storage controls; despite living in `Support/`, it inventories `Sources/Speech/` STT model caches (Parakeet/Whisper), not app-wide caches
 - `SpeakerEmbedderFactory.swift` — app-layer resolution of the optional speaker-embedding model; keeps `Bundle.main`/filesystem lookups out of `TranscriptedCore` and hands the meeting controller a ready `SpeakerSegmentEmbedder` or nil

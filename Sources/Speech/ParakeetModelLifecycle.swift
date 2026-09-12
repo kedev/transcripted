@@ -185,15 +185,6 @@ extension ParakeetEngine {
         await task.value
     }
 
-    /// Await the in-flight model initialization task, if any. Returns true
-    /// when a task was joined. Unlike polling `modelDownloadState`, this
-    /// resumes the moment initialization settles (ready or failed).
-    func joinModelInitialization(variant: ParakeetModelVariant = .v3) async -> Bool {
-        guard modelVariant == variant, let modelInitializationTask else { return false }
-        await modelInitializationTask.value
-        return true
-    }
-
     private func isCurrent(_ token: ParakeetModelWorkToken) -> Bool {
         !isShuttingDown && !Task.isCancelled
             && token.isCurrent(variant: modelVariant, generation: modelInitializationGeneration)

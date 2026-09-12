@@ -36,7 +36,7 @@
 import Foundation
 
 func testBluetoothRouteContract() {
-    runSuite("Bluetooth route contract - output plus built-in mic fallback stays explicit") {
+    runSuite("Bluetooth route contract - opt-in built-in mic recommendation stays explicit") {
         let airPodsInput = bluetoothDevice(1, "Justin's AirPods Pro", inputChannels: 1)
         let airPodsOutput = bluetoothDevice(2, "Justin's AirPods Pro", inputChannels: 0)
         let macBookMic = bluetoothRouteBuiltInDevice(3, "MacBook Pro Microphone")
@@ -44,10 +44,11 @@ func testBluetoothRouteContract() {
         let selection = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
 
-        assertEqual(selection.selectedInput, macBookMic, "Bluetooth headset playback should use the local built-in mic when available")
+        assertEqual(selection.selectedInput, macBookMic, "the faster-start opt-in should recommend the local built-in mic when available")
         assertEqual(selection.defaultOutput, airPodsOutput, "Bluetooth output should remain visible in the mocked route")
         assertEqual(selection.reason, .preferredBuiltInForBluetoothHeadset, "fallback reason should stay queryable in logs and tests")
         assertTrue(selection.didOverrideDefault, "built-in fallback should be reported as an input override")
@@ -116,6 +117,7 @@ func testBluetoothRouteContract() {
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
             availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true,
             allowsBuiltInBluetoothFallback: false
         )
 
@@ -269,7 +271,7 @@ func testBluetoothRouteContract() {
         assertTrue(state.canStartRecording, "successful latest recovery should unblock dictation starts")
     }
 
-    runSuite("Bluetooth route contract - mocked device changes settle through connect and disconnect") {
+    runSuite("Bluetooth route contract - opt-in mocked device changes settle through connect and disconnect") {
         let airPodsInput = bluetoothDevice(1, "Justin's AirPods Pro", inputChannels: 1)
         let airPodsOutput = bluetoothDevice(2, "Justin's AirPods Pro", inputChannels: 0)
         let macBookMic = bluetoothRouteBuiltInDevice(3, "MacBook Pro Microphone")
@@ -335,7 +337,8 @@ func testBluetoothRouteContract() {
         let headsetConnect = DictationInputDeviceSelectionPolicy.selection(
             defaultInput: airPodsInput,
             defaultOutput: airPodsOutput,
-            availableInputs: [airPodsInput, macBookMic]
+            availableInputs: [airPodsInput, macBookMic],
+            prefersBuiltInBluetoothInput: true
         )
         let lowRateReadiness = readiness(
             for: headsetConnect,
@@ -407,7 +410,7 @@ func testBluetoothRouteContract() {
               let bufferFormat = tapBody.range(of: "Self.audioFormatSummary(buffer.format)"),
               let effectiveRate = tapBody.range(of: "ParakeetTapSampleRatePolicy.effectiveSampleRate"),
               let retainedRate = tapBody.range(of: "pendingSamples.append(monoSamples, sampleRate: effectiveSampleRate)"),
-              let segments = inferenceBody.range(of: "let segments = recoveredRecordingTimeline.drain()"),
+              let segments = inferenceBody.range(of: "resampleRecordedSegments(recoveredRecordingTimeline.segments)"),
               let resampleRate = inferenceBody.range(of: "from: segment.sampleRate") else {
             assertTrue(false, "dictation tap should use the delivered buffer format for sample-rate bookkeeping")
             return
@@ -597,7 +600,7 @@ func testBluetoothRouteContract() {
 
     runSuite("Bluetooth route contract - stable recovery echoes do not retire another engine") {
         let source = readSourceFixture("Sources/Speech/ParakeetDeviceRecovery.swift")
-        guard let strategyStart = source.range(of: "switch graphStrategy"),
+        guard let strategyStart = source.range(of: "switch releasedVoiceProcessing ? graphStrategy : .rebuildGraph"),
               let reuseCase = source.range(of: "case .reuseCurrentGraph:", range: strategyStart.upperBound..<source.endIndex),
               let rebuildCase = source.range(of: "case .rebuildGraph:", range: reuseCase.upperBound..<source.endIndex),
               let strategyEnd = source.range(
@@ -615,8 +618,10 @@ func testBluetoothRouteContract() {
             "a stable same-route engine echo must keep the current graph instead of creating another retirement echo"
         )
         assertTrue(
-            rebuildBody.contains("rebuildAudioEngine(reason: \"configuration_change\")"),
-            "real or unproven route changes must keep the full graph replacement path"
+            rebuildBody.contains("rebuildAudioEngine(")
+                && rebuildBody.contains("reason: \"configuration_change\"")
+                && rebuildBody.contains("requiresFreshGraph: forceForMicrophoneSharing || !releasedVoiceProcessing"),
+            "route changes must retain replacement, and sharing or failed disarm must require a fresh graph"
         )
     }
 

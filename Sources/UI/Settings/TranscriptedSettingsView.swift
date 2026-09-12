@@ -63,6 +63,7 @@ struct TranscriptedSettingsView: View {
     @State private var modelCacheCleanupInProgress = false
     @State private var modelCacheCleanupStatus: String?
     @State private var meetingMicProcessingMode = MicrophoneProcessingPreferences.mode()
+    @State private var useSystemMeetingMicrophone = MeetingMicrophonePreferences.usesSystemInput()
     @State private var splitLocalSpeakersEnabled = LocalSpeakerPreferences.isEnabled()
     @State private var autoDetectCallsEnabled = AutoCallDetectionPreferences.isEnabled()
     @State private var audioRetentionWindow = AudioStoragePreferences.deleteAudioAfter()
@@ -225,6 +226,9 @@ struct TranscriptedSettingsView: View {
             // Accepting the mid-meeting mic-boost prompt flips this preference
             // outside Settings; keep an open window's picker in sync.
             meetingMicProcessingMode = MicrophoneProcessingPreferences.mode()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .meetingMicrophonePreferenceChanged)) { _ in
+            useSystemMeetingMicrophone = MeetingMicrophonePreferences.usesSystemInput()
         }
         .onReceive(NotificationCenter.default.publisher(for: .transcriptedPermissionsDidChange)) { _ in
             refreshPermissions()
@@ -1933,7 +1937,15 @@ struct TranscriptedSettingsView: View {
             autoSendEditor: { generalAutoSendEditor },
             speakerEditor: { generalSpeakerMatchingEditor },
             modelEditor: { generalModelSettingsEditor },
-            micProcessingEditor: { generalMicProcessingEditor },
+            micProcessingEditor: {
+                VStack(alignment: .leading, spacing: 0) {
+                    MeetingMicrophoneSettingRow(usesSystemInput: persistedSettingsBinding(
+                        $useSystemMeetingMicrophone,
+                        persist: { MeetingMicrophonePreferences.setUsesSystemInput($0) }
+                    ))
+                    generalMicProcessingEditor
+                }
+            },
             permissionsEditor: { generalPermissionsEditor },
             reportingEditor: { generalReportingEditor }
         )
@@ -2682,6 +2694,7 @@ struct TranscriptedSettingsView: View {
         preferredTranscriptionModel = TranscriptionModelPreferences.preferredModel()
         uiSoundsEnabled = UISoundPreferences.isEnabled()
         meetingMicProcessingMode = MicrophoneProcessingPreferences.mode()
+        useSystemMeetingMicrophone = MeetingMicrophonePreferences.usesSystemInput()
         splitLocalSpeakersEnabled = LocalSpeakerPreferences.isEnabled()
         dictationShortcutsEnabled = HotkeyPreferences.dictationShortcutsEnabled()
         refreshAutoEnterPreferences(includeCandidates: pageShowsAutoEnterSettings(navigation.selectedPage))

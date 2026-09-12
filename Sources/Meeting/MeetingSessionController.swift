@@ -1447,7 +1447,8 @@ final class MeetingSessionController: ObservableObject {
         guard MeetingMicBoostPromptPolicy.shouldPresent(
             isRecording: isRecording,
             voiceProcessingPreferenceEnabled: MicrophoneProcessingPreferences.isVoiceProcessingEnabled(),
-            currentOutcome: micBoostPromptOutcome
+            currentOutcome: micBoostPromptOutcome,
+            microphoneSharingRequired: capture.audio.voiceProcessingSuppressedForMicrophoneSharing
         ) else { return }
         micBoostPromptOutcome = .shown
         micBoostPromptRecordingIdentity = activeRecordingIdentity
@@ -1573,7 +1574,8 @@ final class MeetingSessionController: ObservableObject {
         }
         return MeetingMicBoostPromptPolicy.shouldApplyPromptAction(
             isPromptVisible: isMicBoostPromptVisible,
-            isRecording: isRecording
+            isRecording: isRecording,
+            microphoneSharingRequired: capture.audio.voiceProcessingSuppressedForMicrophoneSharing
         )
     }
 
@@ -3156,7 +3158,10 @@ final class MeetingSessionController: ObservableObject {
     }
 
     private func meetingCaptureAnalyticsProperties(snapshot: AudioPipelineDiagnosticsSnapshot) -> [String: String] {
-        var properties = snapshot.privacySafeContext
+        var properties = snapshot.privacySafeContext.merging(
+            MeetingCaptureVolumeDiagnostics.measurementScope,
+            uniquingKeysWith: { _, scope in scope }
+        )
         properties["gap_count_bucket"] = AnalyticsReporter.countBucket(snapshot.gapCount)
         properties["route_change_count_bucket"] = AnalyticsReporter.countBucket(snapshot.routeChangeCount)
         properties["recovery_attempt_bucket"] = AnalyticsReporter.countBucket(snapshot.recoveryAttemptCount)

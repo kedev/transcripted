@@ -92,7 +92,7 @@ struct DictationMicrophoneTimeoutPresentationPolicy {
         routeContext: [String: String] = [:]
     ) -> String {
         if isBluetoothFallbackRoute(routeContext) {
-            return "Bluetooth audio blocked the mic. Try again."
+            return "Built-in mic unavailable. Choose another input."
         }
 
         if startAttempts > 0, inputFormatReady {
@@ -126,7 +126,9 @@ enum DictationActiveTaskCancellationPolicy {
         sttIsTranscribing: Bool
     ) -> DictationActiveTaskCancellationPlan {
         DictationActiveTaskCancellationPlan(
-            cancelStreamingTask: !sttIsTranscribing,
+            // Cancellation is cooperative: queued work can exit immediately,
+            // while native inference retains its busy state until it returns.
+            cancelStreamingTask: true,
             cancelSpeechEngine: cancelRecording
                 && !sttIsTranscribing
                 && (sttIsRecording || recordingStartWasInFlight)

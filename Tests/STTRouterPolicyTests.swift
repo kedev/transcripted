@@ -11,6 +11,20 @@
 import Foundation
 
 func testSTTRouterPolicy() {
+    runSuite("Both Parakeet variants retain upstream deadline-bound model waiting") {
+        let sourceURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Sources/Speech/STTRouter.swift")
+        let source = try! String(contentsOf: sourceURL, encoding: .utf8)
+        let start = source.range(of: "func waitForRecordingModelLoadProgress(until deadline:")!
+        let end = source.range(of: "func startRecording()", range: start.upperBound..<source.endIndex)!
+        let wait = String(source[start.lowerBound..<end.lowerBound])
+        assertTrue(wait.contains("if recordingModel.parakeetVariant != nil"), "v2 must observe Parakeet progress, not Whisper")
+        assertTrue(wait.contains("parakeetEngine.$modelDownloadState"))
+        assertTrue(wait.contains("whisperEngine.$modelDownloadState"))
+        assertTrue(wait.contains("ModelLoadProgressWaiter.wait(for: changes, until: deadline)"))
+        assertFalse(source.contains("joinModelInitialization"), "UI waits must not directly await unbounded native initialization")
+    }
+
     runSuite("Recording admission establishes the resolved variant before capturing audio") {
         let sourceURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent("Sources/Speech/STTRouter.swift")

@@ -51,7 +51,10 @@ class ParakeetEngine: ObservableObject {
     nonisolated let sharedMeetingMicRecorder = SharedMeetingMicRecorder()
     var sharedMeetingMicTransition = SharedMeetingMicTransitionState()
     // Completed tap batches and recovery segments share one rate-aware timeline.
-    var recoveredRecordingTimeline = RecordedAudioTimeline()
+    private var recordedSamplesRevision: UInt64 = 0
+    var recoveredRecordingTimeline = RecordedAudioTimeline() {
+        didSet { recordedSamplesRevision &+= 1 }
+    }
     var preservingRecordingAcrossRecovery = false
     private nonisolated(unsafe) var nativeSampleRate: Double = 48000
     private nonisolated(unsafe) var audioStartReferenceTime: CFAbsoluteTime?
@@ -62,6 +65,7 @@ class ParakeetEngine: ObservableObject {
     private nonisolated(unsafe) var lastLevelUpdate: CFAbsoluteTime = 0
     var isEnginePrewarmed = false
     private var wakeObserver: NSObjectProtocol?
+    private var microphoneSharingObserver: AnyCancellable?
     var inputDeviceChangeObserverToken: DefaultInputDeviceMonitor.ObserverToken?
     nonisolated let inputDeviceRefreshMailbox = ParakeetInputDeviceRefreshMailbox()
     private var recentAudioEngineRebuildTimestamps: [CFAbsoluteTime] = []
@@ -111,7 +115,7 @@ class ParakeetEngine: ObservableObject {
     private var zombieRecoveryRestartPending: Bool { zombieRecoveryState.isActive }
     private var asrInferenceActivity = ParakeetASRInferenceActivityState()
     private var asrInferenceHandoffCount = 0
-    private var asrInferenceWaiters: [CheckedContinuation<Void, Never>] = []
+    private let asrInferenceWaiters = ASRInferenceWaiterQueue()
     private var pureSampleTranscriptionActivityCount = 0
     var asrManagerReady = false
     nonisolated(unsafe) var didReceiveAudioSamples = false
@@ -331,7 +335,11 @@ class ParakeetEngine: ObservableObject {
     ///
     /// Must be called on `audioEngineQueue` (callers already hop there); the
     /// drain step briefly blocks that queue, never the CoreAudio render thread.
-    nonisolated static func safelyRemoveInputTap(on audioEngine: AVAudioEngine) {
+    @discardableResult
+    nonisolated static func safelyRemoveInputTap(on audioEngine: AVAudioEngine) -> Bool {
+        // Looking up inputNode would create it on a pristine idle engine.
+        // Cleanup may only release a node this graph already owns.
+        let inputNode = existingInputNode(on: audioEngine)
         for step in AudioInputTapTeardownPolicy.steps(engineIsRunning: audioEngine.isRunning) {
             switch step {
             case .stopEngine:
@@ -339,9 +347,20 @@ class ParakeetEngine: ObservableObject {
             case .waitForStoppedInputCallbacks:
                 Thread.sleep(forTimeInterval: AudioInputTapTeardownPolicy.inputCallbackDrainDelay)
             case .removeInputTap:
-                audioEngine.inputNode.removeTap(onBus: 0)
+                inputNode?.removeTap(onBus: 0)
             }
         }
+        return releaseStoppedVoiceProcessing(on: audioEngine)
+    }
+
+    private nonisolated static func existingInputNode(on audioEngine: AVAudioEngine) -> AVAudioInputNode? {
+        audioEngine.attachedNodes.compactMap { $0 as? AVAudioInputNode }.first
+    }
+
+    private nonisolated static func releaseStoppedVoiceProcessing(on audioEngine: AVAudioEngine) -> Bool {
+        guard !audioEngine.isRunning else { return false }
+        guard let inputNode = existingInputNode(on: audioEngine) else { return true }
+        return applyDictationVoiceProcessingPreference(false, to: inputNode)
     }
 
     private nonisolated static func cleanUpLateAudioStart(on audioEngine: AVAudioEngine) {
@@ -547,6 +566,17 @@ class ParakeetEngine: ObservableObject {
 
     private func installAudioObserversIfNeeded() {
         installAudioEngineConfigObserverIfNeeded()
+
+        if microphoneSharingObserver == nil {
+            microphoneSharingObserver = ZoomMicrophoneSharingMonitor.shared.$isZoomRunning
+                .removeDuplicates()
+                .sink { [weak self] isZoomRunning in
+                    guard isZoomRunning else { return }
+                    Task { @MainActor [weak self] in
+                        await self?.shareMicrophoneWithZoomIfNeeded()
+                    }
+                }
+        }
 
         if wakeObserver == nil {
             wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -910,7 +940,12 @@ class ParakeetEngine: ObservableObject {
             inputNode.removeTap(onBus: 0)
             stageTimings["audio_tap_remove_ms"] = Self.elapsedMilliseconds(since: tapRemoveStartedAt)
             let voiceProcessingStartedAt = CFAbsoluteTimeGetCurrent()
-            Self.applyDictationVoiceProcessingPreference(voiceProcessingEnabled, to: inputNode)
+            let appliedVoiceProcessing = Self.applyDictationVoiceProcessingPreference(voiceProcessingEnabled, to: inputNode)
+            guard voiceProcessingEnabled || appliedVoiceProcessing else {
+                throw NSError(domain: "ParakeetEngine", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "Could not release Apple voice processing for shared microphone capture."
+                ])
+            }
             stageTimings["audio_voice_processing_apply_ms"] = Self.elapsedMilliseconds(since: voiceProcessingStartedAt)
             let tapInstallStartedAt = CFAbsoluteTimeGetCurrent()
             inputNode.installTap(onBus: 0, bufferSize: TranscriptedConstants.audioTapBufferSize, format: nil) { [weak self] buffer, _ in
@@ -1037,11 +1072,12 @@ class ParakeetEngine: ObservableObject {
     /// Share the user-consented issue #500 VPIO path with dictation. Meeting
     /// capture owns the prompt; dictation just honors the stable mic-processing
     /// preference on each new recording start.
+    @discardableResult
     private nonisolated static func applyDictationVoiceProcessingPreference(
         _ enabled: Bool,
         to inputNode: AVAudioInputNode
-    ) {
-        guard inputNode.isVoiceProcessingEnabled != enabled else { return }
+    ) -> Bool {
+        guard inputNode.isVoiceProcessingEnabled != enabled else { return true }
         do {
             try inputNode.setVoiceProcessingEnabled(enabled)
             if enabled {
@@ -1053,6 +1089,7 @@ class ParakeetEngine: ObservableObject {
                     )
                 }
             }
+            return inputNode.isVoiceProcessingEnabled == enabled
         } catch {
             let action = enabled ? "enable" : "disable"
             Task { @MainActor in
@@ -1060,19 +1097,72 @@ class ParakeetEngine: ObservableObject {
                     level: .warning,
                     engine: "parakeet",
                     event: "dictation_voice_processing_unavailable",
-                    message: "Could not \(action) dictation voice processing; continuing with current input node mode",
+                    message: "Could not \(action) dictation voice processing",
                     context: ["requested": "\(enabled)"]
                 )
             }
+            return false
         }
     }
 
-    func stopAudioEngine() async {
-        await runAudioEngineWork { audioEngine in
+    @discardableResult
+    func stopAudioEngine() async -> Bool {
+        return await runAudioEngineWork { audioEngine in
             if audioEngine.isRunning {
                 audioEngine.stop()
             }
+            return Self.releaseStoppedVoiceProcessing(on: audioEngine)
         }
+    }
+
+    /// Called only after owned stop/drain work has completed and recording
+    /// bookkeeping is idle. A graph that failed to release VPIO is unsafe to
+    /// keep for another capture; don't retain it for the normal route-churn delay.
+    @discardableResult
+    func discardStoppedVoiceProcessingGraph(
+        ownedBy owner: ParakeetAudioEngineQueueOwnerToken
+    ) -> ParakeetAudioEngineQueueOwnerToken? {
+        guard ownsAudioEngineQueue(owner), !isRecording else { return nil }
+        removeAudioEngineConfigObserver()
+        let stoppedEngine = audioEngine
+        let stoppedQueue = audioEngineQueue
+        audioGraphGeneration += 1
+        audioEngine = AVAudioEngine()
+        // Let this synchronous owner handoff unwind before releasing our last
+        // retained reference on the graph queue. Native disposal may block too.
+        Task { @MainActor in
+            stoppedQueue.async { withExtendedLifetime(stoppedEngine) {} }
+        }
+        inputTapInstalled = false
+        isEnginePrewarmed = false
+        if !isShuttingDown {
+            installAudioEngineConfigObserverIfNeeded()
+        }
+        return currentAudioEngineQueueOwnerToken()
+    }
+
+    private func shareMicrophoneWithZoomIfNeeded() async {
+        guard !isShuttingDown,
+              ZoomMicrophoneSharingMonitor.shared.isZoomRunning,
+              sharedMeetingMicClaim == nil,
+              isRecording,
+              !audioStartInProgress,
+              !audioStopInProgress else { return }
+        let owner = currentAudioEngineQueueOwnerToken()
+        let usesVoiceProcessing = await runAudioEngineWork { audioEngine in
+            Self.existingInputNode(on: audioEngine)?.isVoiceProcessingEnabled == true
+        }
+        guard usesVoiceProcessing,
+              ownsAudioEngineQueue(owner),
+              !isShuttingDown,
+              ZoomMicrophoneSharingMonitor.shared.isZoomRunning,
+              sharedMeetingMicClaim == nil,
+              isRecording,
+              !audioStartInProgress,
+              !audioStopInProgress else { return }
+        // Reuse the owned recovery path so already-spoken audio survives the
+        // VPIO -> regular-input transition when Zoom opens during dictation.
+        await recoverForMicrophoneSharing()
     }
 
     private func resetAudioGraphAfterStartFailure(
@@ -1102,13 +1192,17 @@ class ParakeetEngine: ObservableObject {
         }
         audioGraphGeneration += 1
         let resetOwner = currentAudioGraphOwnerToken()
-        await runAudioEngineWork { audioEngine in
-            Self.safelyRemoveInputTap(on: audioEngine)
+        let releasedVoiceProcessing = await runAudioEngineWork { audioEngine in
+            let released = Self.safelyRemoveInputTap(on: audioEngine)
             audioEngine.reset()
+            return released
         }
         guard ownsAudioGraph(resetOwner) else { return nil }
         inputTapInstalled = false
         isEnginePrewarmed = false
+        if !releasedVoiceProcessing {
+            return discardStoppedVoiceProcessingGraph(ownedBy: currentAudioEngineQueueOwnerToken())?.graphOwner
+        }
         return resetOwner
     }
 
@@ -1146,7 +1240,10 @@ class ParakeetEngine: ObservableObject {
     }
 
     @discardableResult
-    func rebuildAudioEngine(reason: String) async -> ParakeetAudioGraphOwnerToken? {
+    func rebuildAudioEngine(
+        reason: String,
+        requiresFreshGraph: Bool = false
+    ) async -> ParakeetAudioGraphOwnerToken? {
         trackAudioEngineRebuildChurn(reason: reason)
         audioGraphGeneration += 1
         let rebuildOwner = currentAudioGraphOwnerToken()
@@ -1154,12 +1251,16 @@ class ParakeetEngine: ObservableObject {
         defer {
             restoreAudioEngineConfigObserverIfCurrent(rebuildOwner)
         }
-        let retiredEngine = audioEngine
-        await runAudioEngineWork { audioEngine in
-            Self.safelyRemoveInputTap(on: audioEngine)
+        let releasedVoiceProcessing = await runAudioEngineWork { audioEngine in
+            let released = Self.safelyRemoveInputTap(on: audioEngine)
             audioEngine.reset()
+            return released
         }
         guard ownsAudioGraph(rebuildOwner) else { return nil }
+        if !releasedVoiceProcessing {
+            return discardStoppedVoiceProcessingGraph(ownedBy: currentAudioEngineQueueOwnerToken())?.graphOwner
+        }
+        let retiredEngine = audioEngine
         // A stale overlapping rebuild may have restored an observer for the
         // engine being retired. Clear it before binding the replacement.
         removeAudioEngineConfigObserver()
@@ -1179,6 +1280,10 @@ class ParakeetEngine: ObservableObject {
             installAudioEngineConfigObserverIfNeeded()
         }
         guard didReserveRetiredEngine else {
+            if requiresFreshGraph {
+                interruptRecordingPreservingRecoveredTimeline()
+                return nil
+            }
             AppLogger.transcription.warning(
                 "PARAKEET | audio graph reset in place because retirement limit is full"
             )
@@ -1318,9 +1423,12 @@ class ParakeetEngine: ObservableObject {
             audioLevel = 0
         }
 
-        await stopAudioEngine()
+        let releasedVoiceProcessing = await stopAudioEngine()
         guard ownsAudioEngineQueue(wakeCleanupOwner) else { return }
         isEnginePrewarmed = false
+        if !releasedVoiceProcessing {
+            discardStoppedVoiceProcessingGraph(ownedBy: wakeCleanupOwner)
+        }
 
         if wasRecording {
             interruptRecordingPreservingRecoveredTimeline()
@@ -1738,8 +1846,10 @@ class ParakeetEngine: ObservableObject {
                 inputRate: snapshot.hwFormat.sampleRate,
                 outputRate: snapshot.outputFormat.sampleRate
             )
+            ZoomMicrophoneSharingMonitor.shared.refresh()
             let voiceProcessingDecision = DictationVoiceProcessingRoutePolicy.decision(
-                requested: MicrophoneProcessingPreferences.isVoiceProcessingEnabled(),
+                requested: MicrophoneProcessingPreferences.isVoiceProcessingEnabled()
+                    && !ZoomMicrophoneSharingMonitor.shared.isZoomRunning,
                 selection: snapshot.selection
             )
             if voiceProcessingDecision == .deferredForSplitBluetoothOutput {
@@ -1983,6 +2093,12 @@ class ParakeetEngine: ObservableObject {
 
         isRecording = true
         markFormatReadyAndPublish()
+        // Zoom can launch while the worker is starting the graph. Recheck
+        // after start admission finishes; the launch observer cannot recover
+        // a graph still owned by an in-flight start.
+        Task { @MainActor [weak self] in
+            await self?.shareMicrophoneWithZoomIfNeeded()
+        }
         AppLogger.transcription.info("PARAKEET | recording started (\(inputDeviceName), \(safeNativeSampleRate())Hz)")
 
         // Watchdog: detect zombie audio engine (running but no usable signal after sleep/wake).
@@ -1995,40 +2111,7 @@ class ParakeetEngine: ObservableObject {
     }
 
     private func extractMonoSamples(from buffer: AVAudioPCMBuffer) -> [Float]? {
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-
-        guard frameCount > 0, channelCount > 0 else { return [] }
-
-        if channelCount == 1 {
-            guard let channelData = buffer.floatChannelData?[0] else { return nil }
-            return Array(UnsafeBufferPointer(start: channelData, count: frameCount))
-        }
-
-        var monoSamples = Array<Float>(repeating: 0, count: frameCount)
-
-        if buffer.format.isInterleaved {
-            guard let interleavedData = buffer.floatChannelData?[0] else { return nil }
-            for frame in 0..<frameCount {
-                let baseIndex = frame * channelCount
-                var sum: Float = 0
-                for channel in 0..<channelCount {
-                    sum += interleavedData[baseIndex + channel]
-                }
-                monoSamples[frame] = sum / Float(channelCount)
-            }
-            return monoSamples
-        }
-
-        guard let channelData = buffer.floatChannelData else { return nil }
-        for frame in 0..<frameCount {
-            var sum: Float = 0
-            for channel in 0..<channelCount {
-                sum += channelData[channel][frame]
-            }
-            monoSamples[frame] = sum / Float(channelCount)
-        }
-        return monoSamples
+        MicrophoneDownmix.monoSamples(from: buffer)
     }
 
     func currentAudioGraphOwnerToken() -> ParakeetAudioGraphOwnerToken {
@@ -2146,8 +2229,9 @@ class ParakeetEngine: ObservableObject {
         let stopOwner = currentAudioEngineQueueOwnerToken()
         await removeRecordingTap()
         var stillOwnsStopGraph = ownsAudioEngineQueue(stopOwner)
+        var releasedVoiceProcessing = true
         if stillOwnsStopGraph {
-            await stopAudioEngine()
+            releasedVoiceProcessing = await stopAudioEngine()
             stillOwnsStopGraph = ownsAudioEngineQueue(stopOwner)
         }
         await restorePendingSystemInputAfterRecording(
@@ -2159,6 +2243,9 @@ class ParakeetEngine: ObservableObject {
         drainPendingSamplesIntoTimeline()
         isRecording = false
         audioLevel = 0
+        if !releasedVoiceProcessing {
+            discardStoppedVoiceProcessingGraph(ownedBy: stopOwner)
+        }
         let stoppedSampleCount = recoveredRecordingTimeline.totalSourceSampleCount
         let stoppedDuration = recoveredRecordingTimeline.totalDurationSeconds
         AppLogger.transcription.info("PARAKEET | recording stopped (\(stoppedSampleCount) samples, \(String(format: "%.1f", stoppedDuration))s)")
@@ -2234,9 +2321,12 @@ class ParakeetEngine: ObservableObject {
 
     private func drainRecordedSamplesForInference() async -> (nativeSampleCount: Int, samples16k: [Float])? {
         drainPendingSamplesIntoTimeline()
-        let segments = recoveredRecordingTimeline.drain()
-        preservingRecordingAcrossRecovery = false
-        guard let recorded = await Self.resampleRecordedSegments(segments) else { return nil }
+        // Keep native audio until conversion succeeds. A converter failure is
+        // retryable and must not consume the only surviving recording.
+        let claim = ParakeetRecordedSamplesClaim(graphOwner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision)
+        guard let recorded = await resampleRecordedSegments(recoveredRecordingTimeline.segments),
+              claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+        clearRecoveredRecordingTimeline(keepingCapacity: true)
         return (recorded.nativeSampleCount, recorded.samples16k)
     }
 
@@ -2260,24 +2350,36 @@ class ParakeetEngine: ObservableObject {
     func snapshotRecordedSamplesForPersistence() async -> RecordedSpeechSamples? {
         drainPendingSamplesIntoTimeline()
 
-        return await Self.resampleRecordedSegments(recoveredRecordingTimeline.segments)
+        return await resampleRecordedSegments(recoveredRecordingTimeline.segments)
     }
 
-    private static func resampleRecordedSegments(_ segments: [RecordedAudioSegment]) async -> RecordedSpeechSamples? {
+    private func resampleRecordedSegments(_ segments: [RecordedAudioSegment]) async -> RecordedSpeechSamples? {
         let nativeSampleCount = segments.reduce(0) { $0 + $1.samples.count }
         guard nativeSampleCount > 0 else { return nil }
-        let samples16k = await Task.detached(priority: .userInitiated) {
-            var combined: [Float] = []
-            for segment in segments {
-                combined.append(contentsOf: AudioResampler.resample(
-                    segment.samples,
-                    from: segment.sampleRate,
-                    to: TranscriptedConstants.parakeetSampleRate
-                ))
-            }
-            return combined
-        }.value
-        return RecordedSpeechSamples(nativeSampleCount: nativeSampleCount, samples16k: samples16k)
+        let claim = ParakeetRecordedSamplesClaim(graphOwner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision)
+        do {
+            let samples16k = try await Task.detached(priority: .userInitiated) {
+                var combined: [Float] = []
+                for segment in segments {
+                    combined.append(contentsOf: try AudioResampler.resampleForSpeech(
+                        segment.samples,
+                        from: segment.sampleRate,
+                        to: TranscriptedConstants.parakeetSampleRate
+                    ))
+                }
+                return combined
+            }.value
+            guard claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+            return RecordedSpeechSamples(nativeSampleCount: nativeSampleCount, samples16k: samples16k)
+        } catch {
+            guard claim.isCurrent(owner: currentAudioGraphOwnerToken(), revision: recordedSamplesRevision, cancelled: Task.isCancelled) else { return nil }
+            lastEmptyTranscriptionReason = .modelFailure
+            EventReporter.shared.capture(
+                level: .error, engine: "parakeet", event: "audio_conversion_failed",
+                message: "Recorded audio conversion failed; native samples retained for retry"
+            )
+            return nil
+        }
     }
 
     // MARK: - Transcription
@@ -2311,8 +2413,19 @@ class ParakeetEngine: ObservableObject {
         }
 
         isTranscribing = true
-        guard let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording) else {
-            finishExternalTranscription()
+        let conversionOwner = currentAudioGraphOwnerToken()
+        let conversionRevision = recordedSamplesRevision
+        let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording)
+        guard ownsAudioGraph(conversionOwner) else { return nil }
+        if Task.isCancelled {
+            if recorded != nil || recordedSamplesRevision == conversionRevision {
+                finishTranscription()
+            }
+            return nil
+        }
+        guard let recorded else {
+            guard recordedSamplesRevision == conversionRevision else { return nil }
+            isTranscribing = false
             return nil
         }
         let nativeCount = recorded.nativeSampleCount
@@ -2367,7 +2480,8 @@ class ParakeetEngine: ObservableObject {
         finishDeferredModelTeardownIfIdle()
     }
 
-    private func beginASRInference() async {
+    private func beginASRInference() async throws {
+        try Task.checkCancellation()
         if asrInferenceActivity.canStartImmediately(reservedHandoffCount: asrInferenceHandoffCount) {
             asrInferenceActivity.begin()
             return
@@ -2384,19 +2498,16 @@ class ParakeetEngine: ObservableObject {
                 "waiter_count": "\(asrInferenceWaiters.count)"
             ]
         )
-        await withCheckedContinuation { continuation in
-            asrInferenceWaiters.append(continuation)
-        }
+        try await asrInferenceWaiters.wait()
         asrInferenceHandoffCount = max(0, asrInferenceHandoffCount - 1)
         asrInferenceActivity.begin()
     }
 
     private func finishASRInference() {
         asrInferenceActivity.finish()
-        if let next = asrInferenceWaiters.first {
-            asrInferenceWaiters.removeFirst()
+        if !asrInferenceWaiters.isEmpty {
             asrInferenceHandoffCount += 1
-            next.resume()
+            asrInferenceWaiters.resumeFirst()
             return
         }
         finishDeferredModelTeardownIfIdle()
@@ -2406,7 +2517,17 @@ class ParakeetEngine: ObservableObject {
         manager: AsrManager,
         samples: [Float]
     ) async throws -> String {
-        await beginASRInference()
+        let queueStartedAt = ProcessInfo.processInfo.systemUptime
+        try await beginASRInference()
+        let inferenceStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            let finishedAt = ProcessInfo.processInfo.systemUptime
+            let queueWaitMS = (inferenceStartedAt - queueStartedAt) * 1_000
+            let inferenceMS = (finishedAt - inferenceStartedAt) * 1_000
+            // Aggregate local diagnostics only; existing end-to-end timing keeps
+            // its semantics and neither samples nor transcript text are logged.
+            AppLogger.transcription.info("PARAKEET | ASR queue_wait_ms=\(String(format: "%.2f", queueWaitMS)) inference_ms=\(String(format: "%.2f", inferenceMS))")
+        }
         do {
             try Task.checkCancellation()
             // FluidAudio 0.15.x hands decoder-state ownership to the caller. Every batch
@@ -2414,8 +2535,10 @@ class ParakeetEngine: ObservableObject {
             // contaminate each other's decoder context (0.7.9 kept per-source state
             // internally, keyed by the removed `source:` parameter).
             let decoderLayers = await manager.decoderLayerCount
+            try Task.checkCancellation()
             var decoderState = try TdtDecoderState(decoderLayers: decoderLayers)
             let result = try await manager.transcribe(samples, decoderState: &decoderState)
+            try Task.checkCancellation()
             let text = withExtendedLifetime(result) {
                 String(result.text)
             }
@@ -2428,6 +2551,7 @@ class ParakeetEngine: ObservableObject {
     }
 
     func transcribe(preparedRecording: RecordedSpeechSamples? = nil) async -> String? {
+        guard !Task.isCancelled else { return nil }
         lastEmptyTranscriptionReason = nil
         guard !isTranscribing else {
             EventReporter.shared.capture(level: .warning, engine: "parakeet", event: "transcription_already_active",
@@ -2451,8 +2575,19 @@ class ParakeetEngine: ObservableObject {
         isTranscribing = true
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        guard let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording) else {
-            finishTranscription()
+        let conversionOwner = currentAudioGraphOwnerToken()
+        let conversionRevision = recordedSamplesRevision
+        let recorded = await consumeRecordedSamples(preparedRecording: preparedRecording)
+        guard ownsAudioGraph(conversionOwner) else { return nil }
+        if Task.isCancelled {
+            if recorded != nil || recordedSamplesRevision == conversionRevision {
+                finishTranscription()
+            }
+            return nil
+        }
+        guard let recorded else {
+            guard recordedSamplesRevision == conversionRevision else { return nil }
+            isTranscribing = false
             return nil
         }
         let nativeCount = recorded.nativeSampleCount
@@ -2547,6 +2682,7 @@ class ParakeetEngine: ObservableObject {
                         emptyContext["retry_elapsed_s"] = String(format: "%.3f", retryElapsed)
                         emptyContext["retry_samples"] = "\(retrySamples.count)"
                     } catch {
+                        if Task.isCancelled || error is CancellationError { throw CancellationError() }
                         emptyContext["retry_error"] = error.localizedDescription
                     }
                 } else if !analysis.hasUsableSpeechSignal {
@@ -2580,6 +2716,10 @@ class ParakeetEngine: ObservableObject {
                 ])
             return corrected
         } catch {
+            if Task.isCancelled || error is CancellationError {
+                if ownsAudioGraph(conversionOwner) { finishTranscription() }
+                return nil
+            }
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             if let fallbackDecision = ParakeetShortAudioGate.dictationFallback(
                 nativeSampleCount: nativeCount,
@@ -2627,6 +2767,7 @@ class ParakeetEngine: ObservableObject {
     /// - Returns: Transcribed text, trimmed. Empty string if Parakeet returned nothing.
     /// - Throws: Re-throws `AsrManager.transcribe` errors (including model-not-ready).
     func transcribeSamples(_ samples: [Float], source: AudioSource) async throws -> String {
+        try Task.checkCancellation()
         beginPureSampleTranscriptionActivity()
         defer { finishPureSampleTranscriptionActivity() }
 
@@ -2662,6 +2803,7 @@ class ParakeetEngine: ObservableObject {
                 samples: samples
             )
         } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
             if let fallbackDecision = ParakeetShortAudioGate.meetingSegmentFallback(
                 sampleCount: samples.count,
                 sourceDescription: sourceDescription,
@@ -2824,9 +2966,12 @@ class ParakeetEngine: ObservableObject {
             await removeRecordingTap(force: true)
         }
         guard ownsAudioEngineQueue(idleCleanupOwner) else { return nil }
-        await stopAudioEngine()
+        let releasedVoiceProcessing = await stopAudioEngine()
         guard ownsAudioEngineQueue(idleCleanupOwner) else { return nil }
         isEnginePrewarmed = false
+        if !releasedVoiceProcessing {
+            return discardStoppedVoiceProcessingGraph(ownedBy: idleCleanupOwner)
+        }
         return idleCleanupOwner
     }
 
@@ -2888,6 +3033,8 @@ class ParakeetEngine: ObservableObject {
         sharedMeetingMicRecorder.cancel()
         sharedMeetingMicClaim = nil
         isShuttingDown = true
+        microphoneSharingObserver?.cancel()
+        microphoneSharingObserver = nil
         inputDeviceRefreshMailbox.close()
         cancelModelWork()
         cancelAudioWatchdog()

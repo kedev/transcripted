@@ -38,12 +38,16 @@ import FluidAudio
         let engine = ParakeetEngine()
         let first = Task { await engine.initialize(variant: .v2) }
         await waitFor("download-v2#1")
-        let second = Task { await engine.initialize(variant: .v2) }
-        let join = Task { await engine.joinModelInitialization(variant: .v2) }
-        check(!(await engine.joinModelInitialization(variant: .v3)), "other variant must not join")
+        var secondFinished = false
+        let second = Task {
+            await engine.initialize(variant: .v2)
+            secondFinished = true
+        }
+        await settle()
+        check(!secondFinished, "same-variant initialization waits for the shared load")
         await finishLoad("v2")
         await first.value; await second.value
-        check(await join.value, "explicit join awaited production initialization")
+        check(secondFinished, "same-variant initialization resumes when the shared load completes")
         check(engine.isModelLoaded(for: .v2), "v2 ready")
         check(await FakeFluidAudio.shared.events.filter { $0.hasPrefix("download-") }.count == 1, "one shared download")
         let manager = engine.asrManager

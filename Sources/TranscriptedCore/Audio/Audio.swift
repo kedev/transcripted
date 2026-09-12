@@ -567,6 +567,21 @@ public class Audio: ObservableObject, @unchecked Sendable {
     /// into UserDefaults.
     public var enableVoiceProcessing: Bool = false
 
+    private let microphoneSharingSuppression = Atomic<Bool>(false)
+    private let microphoneSharingReconciliationPending = Atomic<Bool>(false)
+
+    /// Host-owned call-app protection, independent of the user's processing
+    /// preference. Set before start; a live false -> true transition must also
+    /// call reconcileMicrophoneSharing(). Keep it latched until the next start.
+    public var voiceProcessingSuppressedForMicrophoneSharing: Bool {
+        get { microphoneSharingSuppression.load(ordering: .acquiring) }
+        set { microphoneSharingSuppression.store(newValue, ordering: .releasing) }
+    }
+
+    var shouldArmVoiceProcessing: Bool {
+        enableVoiceProcessing && !voiceProcessingSuppressedForMicrophoneSharing
+    }
+
     /// Whether Transcripted should run its software gain control on the copied
     /// mic buffer when Apple voice processing is not active. Default on for the
     /// existing quiet-WebRTC recovery path; users with tuned hardware mics can
@@ -701,11 +716,37 @@ public class Audio: ObservableObject, @unchecked Sendable {
     // Meeting input is selected once at start and then pinned for the session.
     // Recovery may make one bounded built-in fallback after a real Bluetooth
     // mic outage, but it must never follow a changing system default forever.
+    private var _meetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode = .automatic
+    private var _activeMeetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode = .automatic
     private var _meetingInputSelection: MeetingInputDeviceSelection?
     private var _meetingRouteStabilizationAttemptCount = 0
     private var _meetingRouteStabilizationOutcome: CaptureRouteStabilizationOutcome = .notNeeded
     private var _meetingRouteStabilityWarningEmitted = false
     private let meetingRouteStateLock = NSLock()
+
+    /// The host's microphone preference for the next recording. Set before
+    /// `start()`. The active recording retains its start-time mode through
+    /// recovery; changing this property only affects the next recording.
+    /// Preserving the macOS input still permits the existing bounded built-in
+    /// fallback after an actual Bluetooth route failure.
+    public var meetingInputDeviceSelectionMode: MeetingInputDeviceSelectionMode {
+        get {
+            meetingRouteStateLock.lock()
+            defer { meetingRouteStateLock.unlock() }
+            return _meetingInputDeviceSelectionMode
+        }
+        set {
+            meetingRouteStateLock.lock()
+            _meetingInputDeviceSelectionMode = newValue
+            meetingRouteStateLock.unlock()
+        }
+    }
+
+    var meetingInputDeviceSelectionModeForCurrentRecording: MeetingInputDeviceSelectionMode {
+        meetingRouteStateLock.lock()
+        defer { meetingRouteStateLock.unlock() }
+        return _activeMeetingInputDeviceSelectionMode
+    }
 
     var meetingInputSelectionReasonValue: String {
         meetingRouteStateLock.lock()
@@ -774,8 +815,11 @@ public class Audio: ObservableObject, @unchecked Sendable {
         meetingRouteStateLock.unlock()
     }
 
-    func resetMeetingRouteState() {
+    func resetMeetingRouteState(forNewRecording: Bool = false) {
         meetingRouteStateLock.lock()
+        if forNewRecording {
+            _activeMeetingInputDeviceSelectionMode = _meetingInputDeviceSelectionMode
+        }
         _meetingInputSelection = nil
         _meetingRouteStabilizationAttemptCount = 0
         _meetingRouteStabilizationOutcome = .notNeeded
@@ -1625,7 +1669,7 @@ public class Audio: ObservableObject, @unchecked Sendable {
                 // standard non-VPIO path instead. Permission gating and the
                 // mic/system readiness latches downstream are untouched.
                 if VoiceProcessingStartFallbackPolicy.shouldRetryWithoutVoiceProcessing(
-                    voiceProcessingRequested: enableVoiceProcessing,
+                    voiceProcessingRequested: shouldArmVoiceProcessing,
                     previousAttemptVoiceProcessingActive: lastAttemptVoiceProcessingActive,
                     fallbackAlreadyEngaged: voiceProcessingFallbackEngaged
                 ) {
@@ -1924,7 +1968,7 @@ public class Audio: ObservableObject, @unchecked Sendable {
     ) -> VoiceProcessingBindResult {
         let boundInputDeviceIDBeforeWrap = inputNode.auAudioUnit.deviceID
 
-        guard enableVoiceProcessing, !suppressedByStartFallback else {
+        guard shouldArmVoiceProcessing, !suppressedByStartFallback else {
             // Opt-in toggle is off. Be explicit here instead of trusting our
             // cached flag, because a prior route change can leave VPIO armed
             // until the input node is told to release it.
@@ -1938,7 +1982,8 @@ public class Audio: ObservableObject, @unchecked Sendable {
             let voiceProcessingEnabledBeforeDisarm = voiceProcessingEnabled
             disarmVoiceProcessing(
                 on: inputNode,
-                reason: suppressedByStartFallback ? "start_fallback_non_vpio" : "preference_off"
+                reason: voiceProcessingSuppressedForMicrophoneSharing ? "shared_microphone"
+                    : (suppressedByStartFallback ? "start_fallback_non_vpio" : "preference_off")
             )
             return VoiceProcessingBindResult(
                 boundInputDeviceIDBeforeWrap: boundInputDeviceIDBeforeWrap,
@@ -2046,7 +2091,7 @@ public class Audio: ObservableObject, @unchecked Sendable {
         micHostPCMBufferFanout.begin(generation: sessionGeneration)
         writeBackpressureStopAdmission.begin(generation: sessionGeneration)
         beginWriteErrorTracking(generation: sessionGeneration)
-        resetMeetingRouteState()
+        resetMeetingRouteState(forNewRecording: true)
         recordVoiceProcessingStartFallback(.none)
 
         // Reset capture artifacts so a previous session cannot make a new start
@@ -2218,6 +2263,9 @@ public class Audio: ObservableObject, @unchecked Sendable {
 
         isRecording = true
         isStarting = false
+        // Zoom may have launched after this graph armed VPIO but before start
+        // completed. Recheck after publishing recording intent, too.
+        reconcileMicrophoneSharing()
         // Arm even when the graph has not delivered its first mic frame yet.
         // A Bluetooth-to-built-in handoff can pass device/rate validation and
         // `engine.start()` while still producing zero frames. The watchdog's
@@ -2406,6 +2454,9 @@ public class Audio: ObservableObject, @unchecked Sendable {
                             operation: "recording_stop"
                         )
                         self.disarmVoiceProcessing(on: inputNodeRef)
+                        // Do not retain an idle VPIO graph if disarming failed.
+                        self.engine = nil
+                        self.inputNode = nil
                     }
 
                     // Drop the RealtimeAGC reference so gain history doesn't
@@ -2491,6 +2542,31 @@ public class Audio: ObservableObject, @unchecked Sendable {
         let sessionGeneration = recordingSessionGeneration
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.recoverFromDeviceChange(sessionGeneration: sessionGeneration, reason: .processingChange)
+        }
+    }
+
+    /// Release an active VPIO graph when a call app needs the shared mic.
+    /// Recovery preserves the selected input, system stream and saved mic
+    /// segments. Check under the graph lock off-main; never touch idle hardware.
+    public func reconcileMicrophoneSharing() {
+        guard voiceProcessingSuppressedForMicrophoneSharing else { return }
+        // A blocked native graph must not accumulate a worker every watchdog
+        // tick. The current worker keeps admission until it actually returns.
+        guard microphoneSharingReconciliationPending.compareExchange(
+            expected: false, desired: true, ordering: .acquiringAndReleasing
+        ).exchanged else { return }
+        let sessionGeneration = recordingSessionGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            defer { self.microphoneSharingReconciliationPending.store(false, ordering: .releasing) }
+            let needsRestart = self.withAudioGraphLock {
+                self.recordingSessionGeneration == sessionGeneration
+                    && self.isRecording && !self.isMicRecovering
+                    && self.voiceProcessingSuppressedForMicrophoneSharing
+                    && self.voiceProcessingEnabled
+            }
+            guard needsRestart else { return }
+            self.recoverFromDeviceChange(sessionGeneration: sessionGeneration, reason: .processingChange)
         }
     }
 

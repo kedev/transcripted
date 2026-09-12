@@ -4,6 +4,17 @@
 import Foundation
 
 func testParakeetAudioGraphOwnership() async {
+    runSuite("Recorded conversion rejects cancelled, replaced, or discarded audio") {
+        let engine = NSObject()
+        let owner = ParakeetAudioGraphOwnerToken(generation: 3, engine: engine)
+        let claim = ParakeetRecordedSamplesClaim(graphOwner: owner, revision: 10)
+        assertTrue(claim.isCurrent(owner: owner, revision: 10, cancelled: false), "unchanged stopped audio can commit")
+        assertFalse(claim.isCurrent(owner: owner, revision: 10, cancelled: true), "cancelled conversion cannot publish errors or consume")
+        assertFalse(claim.isCurrent(owner: owner, revision: 11, cancelled: false), "same-graph discard/replacement invalidates conversion")
+        assertFalse(claim.isCurrent(owner: ParakeetAudioGraphOwnerToken(generation: 4, engine: engine), revision: 10, cancelled: false), "new recording generation owns its samples")
+        assertFalse(claim.isCurrent(owner: ParakeetAudioGraphOwnerToken(generation: 3, engine: NSObject()), revision: 10, cancelled: false), "replacement graph invalidates conversion")
+    }
+
     runSuite("ParakeetZombieRecoveryOwnershipPolicy accepts only the exact active graph owner") {
         let engine = NSObject()
         let owner = ParakeetAudioGraphOwnerToken(generation: 7, engine: engine)
@@ -706,8 +717,14 @@ func testParakeetAudioGraphOwnership() async {
 
         let entered = countLock.withLock { workersEntered }
         assertEqual(entered, 2, "the circuit must cap permanently blocked worker closures")
-        assertEqual(timeoutErrors, 2, "only the two admitted blocked workers should time out")
-        assertEqual(circuitOpenErrors, 10, "later attempts should fail immediately without new workers")
+        // The timeout starts when work is enqueued, not when its utility
+        // queue enters the closure. Under host load an attempt can expire
+        // before entry; that correctly consumes no blocked-worker capacity.
+        let queueExpiryErrors = timeoutErrors - entered
+        assertTrue(queueExpiryErrors >= 0, "every admitted blocked worker must time out")
+        assertEqual(timeoutErrors + circuitOpenErrors, 12, "every attempt must fail through the bounded coordinator")
+        assertTrue(circuitOpenErrors > 0, "after two workers block, later attempts must fail without entering work")
+        assertEqual(circuitOpenErrors, 10 - queueExpiryErrors, "only pre-entry queue expiries may replace circuit-open outcomes")
 
         for _ in 0..<entered {
             releaseWorkers.signal()
